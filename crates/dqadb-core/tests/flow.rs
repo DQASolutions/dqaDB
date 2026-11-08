@@ -308,3 +308,27 @@ fn sparql_select_filter_ask_graph_and_errors() {
         .unwrap_err();
     assert_eq!(err.exit_code(), 2);
 }
+
+#[test]
+fn scans_cross_page_boundaries() {
+    // 1,500 organisations x 2 triples: well past the 1,024-row scan page
+    let (_dir, kb) = new_kb();
+    let mut list = Vec::new();
+    for n in 0..1500 {
+        list.push(serde_json::json!({"op": "add", "s": format!("_:o{n}"), "p": "rdf:type", "o": "ex:Organization"}));
+        list.push(serde_json::json!({"op": "add", "s": format!("_:o{n}"), "p": "rdfs:label", "o": format!("Org {n}")}));
+    }
+    kb.assert(&ops(serde_json::Value::Array(list)), &opts())
+        .unwrap();
+    let triples = kb.status().unwrap().counts.triples;
+    assert_eq!(triples, 3000);
+    let all = select(&kb, "SELECT (COUNT(*) AS ?n) WHERE { ?s ?p ?o }");
+    assert_eq!(all, vec![vec!["3000".to_string()]]);
+    let orgs = select(
+        &kb,
+        "SELECT (COUNT(DISTINCT ?s) AS ?n) WHERE { ?s a ex:Organization ; rdfs:label ?l }",
+    );
+    assert_eq!(orgs, vec![vec!["1500".to_string()]]);
+    let first = kb.fingerprint().unwrap();
+    assert_eq!(kb.rebuild().unwrap().fingerprint, first);
+}

@@ -29,7 +29,7 @@ pub enum Error {
     #[error("yaml: {0}")]
     Yaml(#[from] serde_yaml::Error),
     #[error("store: {0}")]
-    Store(#[from] heed::Error),
+    Store(#[from] rusqlite::Error),
 }
 
 impl Error {

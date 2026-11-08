@@ -155,8 +155,8 @@ impl Kb {
     pub fn index_dir(&self) -> PathBuf {
         self.root.join(".dqadb")
     }
-    fn store_dir(&self) -> PathBuf {
-        self.index_dir().join("store")
+    fn store_path(&self) -> PathBuf {
+        self.index_dir().join("index.sqlite")
     }
     fn main_schema(&self) -> PathBuf {
         self.root.join(&self.config.ontology_main)
@@ -223,17 +223,18 @@ impl Kb {
         if let Some(s) = guard.as_ref() {
             return Ok(s.clone());
         }
-        let s = Arc::new(Store::open(&self.store_dir())?);
+        // derived data from the LMDB-based format (store formats 1-2): safe to drop
+        let legacy = self.index_dir().join("store");
+        if legacy.is_dir() {
+            std::fs::remove_dir_all(&legacy)?;
+        }
+        let s = Arc::new(Store::open(&self.store_path())?);
         *guard = Some(s.clone());
         Ok(s)
     }
 
     fn close_store(&self) {
-        if let Some(s) = self.store.lock().unwrap().take()
-            && let Ok(s) = Arc::try_unwrap(s)
-        {
-            s.close();
-        }
+        self.store.lock().unwrap().take();
     }
 
     pub fn ontology(&self) -> Result<Ontology> {
@@ -261,8 +262,8 @@ impl Kb {
         let store = self.store()?;
         let inference = self.ontology()?.inference();
         let (wm, rules) = {
-            let r = store.read_txn()?;
-            (store.watermark(&r)?, store.inference_hash(&r)?)
+            let r = store.read()?;
+            (r.watermark()?, r.inference_hash()?)
         };
         let latest = event::latest(&self.events_dir())?;
         if latest <= wm && rules.as_deref() == Some(inference.hash.as_str()) {
@@ -276,8 +277,8 @@ impl Kb {
 
     fn sync_locked(&self, store: &Store, inference: &Inference) -> Result<usize> {
         let (wm, rules) = {
-            let r = store.read_txn()?;
-            (store.watermark(&r)?, store.inference_hash(&r)?)
+            let r = store.read()?;
+            (r.watermark()?, r.inference_hash()?)
         };
         let files = event::list_after(&self.events_dir(), wm)?;
         if files.is_empty() && rules.as_deref() != Some(inference.hash.as_str()) {
@@ -287,40 +288,44 @@ impl Kb {
         replay(store, &files, inference)
     }
 
-    /// Rebuild `.dqadb/` from scratch into a temp dir, then swap it in.
+    /// Rebuild the index from scratch into a temp file, then install it.
+    /// Installing goes through SQLite's backup API, so other processes reading the
+    /// index see either the old or the new content, never a mix.
     pub fn rebuild(&self) -> Result<RebuildReport> {
         let started = Instant::now();
         let _lock = self.lock()?;
-        self.close_store();
         let tmp_root = self.index_dir().join("tmp");
-        let tmp = tmp_root.join("store");
         if tmp_root.exists() {
             std::fs::remove_dir_all(&tmp_root)?;
         }
+        let tmp = tmp_root.join("index.sqlite");
         let files = event::list_after(&self.events_dir(), None)?;
         let inference = self.ontology()?.inference();
         let (counts, fingerprint) = {
-            let store = Store::open(&tmp)?;
+            let store = Store::open_bulk(&tmp)?;
             replay(&store, &files, &inference)?;
             store.batch(&inference)?.commit()?;
-            let counts = store.counts(&*store.read_txn()?)?;
-            let fp = store.fingerprint()?;
-            store.close();
-            (counts, fp)
-        };
-        let live = self.store_dir();
-        let old = self.index_dir().join("store.old");
-        if old.exists() {
-            std::fs::remove_dir_all(&old)?;
+            let counts = store.read()?.counts()?;
+            (counts, store.fingerprint()?)
+        }; // closing the connection checkpoints and removes the WAL
+
+        match self.store() {
+            Ok(live) => live.restore_from(&tmp)?,
+            Err(Error::IndexStale(_)) => {
+                // live index has an old layout and nobody can use it: replace the file
+                self.close_store();
+                let live = self.store_path();
+                for suffix in ["", "-wal", "-shm"] {
+                    let f = PathBuf::from(format!("{}{suffix}", live.display()));
+                    if f.exists() {
+                        std::fs::remove_file(f)?;
+                    }
+                }
+                std::fs::rename(&tmp, &live)?;
+            }
+            Err(e) => return Err(e),
         }
-        if live.exists() {
-            std::fs::rename(&live, &old)?;
-        }
-        std::fs::rename(&tmp, &live)?;
         std::fs::remove_dir_all(&tmp_root)?;
-        if old.exists() {
-            std::fs::remove_dir_all(&old)?;
-        }
         let store = self.store()?;
         self.write_manifest(&store, Some(fingerprint.clone()))?;
         Ok(RebuildReport {
@@ -332,14 +337,14 @@ impl Kb {
     }
 
     fn write_manifest(&self, store: &Store, fingerprint: Option<String>) -> Result<()> {
-        let r = store.read_txn()?;
+        let r = store.read()?;
         let m = Manifest {
             dqadb: 1,
-            watermark: store.watermark(&r)?.map(|u| u.to_string()),
+            watermark: r.watermark()?.map(|u| u.to_string()),
             ontology: ontology::read_lock(&self.generated_dir())?.map(|l| l.hash),
             embedding: self.config.embedding.clone(),
-            indexes: serde_json::json!({ "store": { "format": "lmdb", "version": STORE_FORMAT } }),
-            counts: store.counts(&r)?,
+            indexes: serde_json::json!({ "store": { "format": "sqlite", "version": STORE_FORMAT } }),
+            counts: r.counts()?,
             fingerprint,
         };
         std::fs::write(
@@ -357,10 +362,10 @@ impl Kb {
         let onto = self.ontology()?;
         self.sync()?;
         let store = self.store()?;
-        let r = store.read_txn()?;
+        let r = store.read()?;
         let base = self.config.base_iri.clone();
         let mut mint = || format!("{base}{}", Ulid::generate());
-        let existing = |s: &str, p: &str| values(&store, &r, s, p).unwrap_or_default();
+        let existing = |s: &str, p: &str| r.values(s, p).unwrap_or_default();
         onto.normalize(input, &mut mint, &existing)
             .map_err(Error::Validation)
     }
@@ -541,8 +546,8 @@ impl Kb {
 
     pub fn status(&self) -> Result<Status> {
         let store = self.store()?;
-        let r = store.read_txn()?;
-        let wm = store.watermark(&r)?;
+        let r = store.read()?;
+        let wm = r.watermark()?;
         let latest = event::latest(&self.events_dir())?;
         let ontology = match ontology::check_fresh(&self.ontology_dir(), &self.generated_dir()) {
             Ok(h) => format!("ok ({h})"),
@@ -556,7 +561,7 @@ impl Kb {
             latest_event: latest.map(|u| u.to_string()),
             in_sync: latest <= wm,
             ontology,
-            counts: store.counts(&r)?,
+            counts: r.counts()?,
         })
     }
 
@@ -596,7 +601,7 @@ impl Kb {
             })
             .collect();
         let store = self.store()?;
-        let indexed = store.counts(&*store.read_txn()?)?.events;
+        let indexed = store.read()?.counts()?.events;
         Ok(VerifyReport {
             events: files.len(),
             indexed_events: indexed,
@@ -638,21 +643,19 @@ impl Kb {
         let onto = self.ontology()?;
         let full = onto.prefixes.expand(iri).map_err(Error::Other)?;
         let store = self.store()?;
-        let r = store.read_txn()?;
+        let r = store.read()?;
         let not_found = || Error::NotFound(format!("entity {iri}"));
-        let sid = store
-            .term_id(&r, &Term::Iri(full.clone()))?
-            .ok_or_else(not_found)?;
-        let out = store.outgoing(&r, sid)?;
-        let inc = store.incoming(&r, sid)?;
+        let sid = r.term_id(&Term::Iri(full.clone()))?.ok_or_else(not_found)?;
+        let out = r.outgoing(sid)?;
+        let inc = r.incoming(sid)?;
         if out.is_empty() && inc.is_empty() {
             return Err(not_found());
         }
-        let label_pid = store.term_id(&r, &Term::Iri(rdf::RDFS_LABEL.into()))?;
+        let label_pid = r.term_id(&Term::Iri(rdf::RDFS_LABEL.into()))?;
         let label_of = |id: u64| -> Result<Option<String>> {
             let Some(lp) = label_pid else { return Ok(None) };
-            Ok(match store.objects(&r, id, lp)?.first() {
-                Some(o) => Some(match store.term(&r, *o)? {
+            Ok(match r.objects(id, lp)?.first() {
+                Some(o) => Some(match r.term(*o)? {
                     Term::Literal(l) => l.value,
                     t => onto.prefixes.display(&t),
                 }),
@@ -670,9 +673,9 @@ impl Kb {
         };
         let mut last: Option<Ulid> = None;
         for (p, o) in &out {
-            let p_term = store.term(&r, *p)?;
-            let o_term = store.term(&r, *o)?;
-            let prov = store.provenance(&r, sid, *p, *o)?;
+            let p_term = r.term(*p)?;
+            let o_term = r.term(*o)?;
+            let prov = r.provenance(sid, *p, *o)?;
             last = last.max(prov.iter().copied().max());
             let p_iri = p_term.as_iri().unwrap_or_default();
             if p_iri == rdf::RDF_TYPE {
@@ -698,8 +701,8 @@ impl Kb {
         }
         for (s, p) in inc.iter().take(20) {
             card.incoming.push(PropValue {
-                p: onto.compact(store.term(&r, *p)?.as_iri().unwrap_or_default()),
-                value: onto.prefixes.display(&store.term(&r, *s)?),
+                p: onto.compact(r.term(*p)?.as_iri().unwrap_or_default()),
+                value: onto.prefixes.display(&r.term(*s)?),
                 label: label_of(*s)?,
                 is_iri: true,
             });
@@ -720,10 +723,10 @@ impl Kb {
         self.sync()?;
         let onto = self.ontology()?;
         let store = self.store()?;
-        let txn = store.read_txn()?;
+        let reader = store.read()?;
         let event_ns = self.event_namespace();
         let events_dir = self.events_dir();
-        let dataset = sparql::KbDataset::new(&store, &txn, &event_ns, &events_dir);
+        let dataset = sparql::KbDataset::new(&reader, &event_ns, &events_dir);
         sparql::run(dataset, &onto.prefixes, query, limits)
     }
 
@@ -731,20 +734,6 @@ impl Kb {
     pub fn event_namespace(&self) -> String {
         format!("{}event:", self.config.base_iri)
     }
-}
-
-fn values(store: &Store, r: &heed::RoTxn, s: &str, p: &str) -> Result<Vec<Term>> {
-    let (Some(s), Some(p)) = (
-        store.term_id(r, &Term::Iri(s.into()))?,
-        store.term_id(r, &Term::Iri(p.into()))?,
-    ) else {
-        return Ok(Vec::new());
-    };
-    store
-        .objects(r, s, p)?
-        .into_iter()
-        .map(|o| store.term(r, o))
-        .collect()
 }
 
 /// Monotonic ULID: never at or before the newest event on disk, even if the clock went back.

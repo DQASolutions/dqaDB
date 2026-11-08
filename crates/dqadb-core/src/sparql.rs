@@ -15,7 +15,7 @@ use ulid::Ulid;
 use crate::error::ValidationReport;
 use crate::event::{self, OpKind};
 use crate::rdf::{Prefixes, Term, XSD_STRING};
-use crate::store::{Id, Store, Txn, key2, key3, prov_event, split3};
+use crate::store::{Id, Reader};
 use crate::{Error, Result};
 
 /// Term as seen by the evaluator: a dictionary id, an event graph, or a term that is not
@@ -29,8 +29,7 @@ pub enum DTerm {
 
 #[derive(Clone, Copy)]
 pub struct KbDataset<'a> {
-    store: &'a Store,
-    txn: &'a Txn<'a>,
+    reader: &'a Reader<'a>,
     event_ns: &'a str,
     events_dir: &'a Path,
 }
@@ -67,15 +66,9 @@ fn from_ox(t: &OxTerm) -> Option<Term> {
 }
 
 impl<'a> KbDataset<'a> {
-    pub fn new(
-        store: &'a Store,
-        txn: &'a Txn<'a>,
-        event_ns: &'a str,
-        events_dir: &'a Path,
-    ) -> Self {
+    pub fn new(reader: &'a Reader<'a>, event_ns: &'a str, events_dir: &'a Path) -> Self {
         Self {
-            store,
-            txn,
+            reader,
             event_ns,
             events_dir,
         }
@@ -83,32 +76,11 @@ impl<'a> KbDataset<'a> {
 
     /// Triples of the default graph matching a pattern of dictionary ids.
     fn triples(self, s: Option<Id>, p: Option<Id>, o: Option<Id>) -> Result<Triples<'a>> {
-        let st = self.store;
-        let txn: &'a Txn<'a> = self.txn;
-        let map = |it: heed::RoPrefix<'a, heed::types::Bytes, heed::types::Unit>,
-                   f: fn(Id, Id, Id) -> (Id, Id, Id)|
-         -> Triples<'a> {
-            Box::new(it.map(move |r| {
-                let (a, b, c) = split3(r?.0);
-                Ok(f(a, b, c))
-            }))
-        };
-        let spo = |a, b, c| (a, b, c);
-        let pos = |p, o, s| (s, p, o);
-        let osp = |o, s, p| (s, p, o);
-        Ok(match (s, p, o) {
-            (Some(s), Some(p), Some(o)) => {
-                let hit = st.spo.get(txn, &key3(s, p, o))?.is_some();
-                Box::new(hit.then_some(Ok((s, p, o))).into_iter())
-            }
-            (Some(s), Some(p), None) => map(st.spo.prefix_iter(txn, &key2(s, p))?, spo),
-            (Some(s), None, Some(o)) => map(st.osp.prefix_iter(txn, &key2(o, s))?, osp),
-            (Some(s), None, None) => map(st.spo.prefix_iter(txn, &s.to_be_bytes())?, spo),
-            (None, Some(p), Some(o)) => map(st.pos.prefix_iter(txn, &key2(p, o))?, pos),
-            (None, Some(p), None) => map(st.pos.prefix_iter(txn, &p.to_be_bytes())?, pos),
-            (None, None, Some(o)) => map(st.osp.prefix_iter(txn, &o.to_be_bytes())?, osp),
-            (None, None, None) => Box::new(st.spo.iter(txn)?.map(|r| Ok(split3(r?.0)))),
-        })
+        if let (Some(s), Some(p), Some(o)) = (s, p, o) {
+            let hit = self.reader.has_triple(s, p, o)?;
+            return Ok(Box::new(hit.then_some(Ok((s, p, o))).into_iter()));
+        }
+        Ok(Box::new(self.reader.scan(s, p, o)))
     }
 
     /// Triples one event asserted that are still in effect.
@@ -123,12 +95,13 @@ impl<'a> KbDataset<'a> {
             return Ok(Vec::new());
         };
         let ev = event::read_event(&path)?;
+        let r = self.reader;
         let mut out = Vec::new();
         for op in ev.ops.iter().filter(|op| op.op == OpKind::Add) {
             let ids = (
-                self.store.term_id(self.txn, &Term::Iri(op.s.clone()))?,
-                self.store.term_id(self.txn, &Term::Iri(op.p.clone()))?,
-                self.store.term_id(self.txn, &op.o)?,
+                r.term_id(&Term::Iri(op.s.clone()))?,
+                r.term_id(&Term::Iri(op.p.clone()))?,
+                r.term_id(&op.o)?,
             );
             let (Some(ts), Some(tp), Some(to)) = ids else {
                 continue;
@@ -139,13 +112,11 @@ impl<'a> KbDataset<'a> {
             {
                 continue;
             }
-            let mut pk = [0u8; 40];
-            pk[..24].copy_from_slice(&key3(ts, tp, to));
-            pk[24..].copy_from_slice(&id.0.to_be_bytes());
-            if self.store.prov.get(self.txn, &pk)?.is_some() {
+            if r.asserted_by(ts, tp, to, id)? {
                 out.push((ts, tp, to));
             }
         }
+        out.sort();
         out.dedup();
         Ok(out)
     }
@@ -188,19 +159,20 @@ impl<'a> KbDataset<'a> {
             }
             Some(Some(_)) => Ok(Box::new(std::iter::empty())),
             None => {
-                let st = self.store;
-                let txn: &'a Txn<'a> = self.txn;
+                let r = self.reader;
                 Ok(Box::new(self.triples(s, p, o)?.flat_map(
-                    move |r| -> Quads<'a> {
-                        let (a, b, c) = match r {
+                    move |t| -> Quads<'a> {
+                        let t = match t {
                             Ok(t) => t,
                             Err(e) => return Box::new(std::iter::once(Err(e))),
                         };
-                        match st.prov.prefix_iter(txn, &key3(a, b, c)) {
-                            Ok(it) => Box::new(it.map(move |k| {
-                                Ok(quad((a, b, c), Some(DTerm::Event(prov_event(k?.0)))))
-                            })),
-                            Err(e) => Box::new(std::iter::once(Err(e.into()))),
+                        match r.provenance(t.0, t.1, t.2) {
+                            Ok(events) => Box::new(
+                                events
+                                    .into_iter()
+                                    .map(move |e| Ok(quad(t, Some(DTerm::Event(e))))),
+                            ),
+                            Err(e) => Box::new(std::iter::once(Err(e))),
                         }
                     },
                 )))
@@ -236,7 +208,7 @@ impl<'a> QueryableDataset<'a> for KbDataset<'a> {
             return Ok(DTerm::Event(id));
         }
         Ok(match from_ox(&term) {
-            Some(t) => match self.store.term_id(self.txn, &t)? {
+            Some(t) => match self.reader.term_id(&t)? {
                 Some(id) => DTerm::Id(id),
                 None => DTerm::Ext(term),
             },
@@ -246,7 +218,7 @@ impl<'a> QueryableDataset<'a> for KbDataset<'a> {
 
     fn externalize_term(&self, term: DTerm) -> Result<OxTerm> {
         Ok(match term {
-            DTerm::Id(id) => to_ox(&self.store.term(self.txn, id)?),
+            DTerm::Id(id) => to_ox(&self.reader.term(id)?),
             DTerm::Event(e) => NamedNode::new_unchecked(format!("{}{e}", self.event_ns)).into(),
             DTerm::Ext(t) => t,
         })
