@@ -332,3 +332,120 @@ fn scans_cross_page_boundaries() {
     let first = kb.fingerprint().unwrap();
     assert_eq!(kb.rebuild().unwrap().fingerprint, first);
 }
+
+#[test]
+fn search_traverse_and_path() {
+    use dqadb_core::search::SearchQuery;
+    let (_dir, kb) = new_kb();
+    let res = kb.assert(&acme(), &opts()).unwrap();
+    let acme_iri = res.id_map["_:acme"].replace("urn:dqadb:", "dqadb:");
+    let c1 = res.id_map["_:c1"].replace("urn:dqadb:", "dqadb:");
+    let beta = kb
+        .assert(
+            &ops(serde_json::json!([
+                {"op": "add", "s": "_:b", "p": "rdf:type", "o": "ex:Company"},
+                {"op": "add", "s": "_:b", "p": "rdfs:label", "o": "Beta Shipping"},
+                {"op": "add", "s": "_:b", "p": "ex:country", "o": "SG"},
+                {"op": "add", "s": "_:b", "p": "ex:has_contract", "o": c1},
+                {"op": "add", "s": "_:b", "p": "ex:has_contract", "o": "_:c2"},
+                {"op": "add", "s": "_:c2", "p": "rdf:type", "o": "ex:Contract"},
+                {"op": "add", "s": "_:c2", "p": "rdfs:label", "o": "HĐ 7"},
+                {"op": "add", "s": "_:c2", "p": "ex:value", "o": 900},
+                {"op": "add", "s": "_:c2", "p": "ex:status", "o": "draft"}
+            ])),
+            &opts(),
+        )
+        .unwrap();
+    let beta_iri = beta.id_map["_:b"].replace("urn:dqadb:", "dqadb:");
+
+    let q = |types: &[&str], wheres: &[&str]| {
+        let page = kb
+            .search(&SearchQuery {
+                types: types.iter().map(|s| s.to_string()).collect(),
+                wheres: wheres.iter().map(|s| s.to_string()).collect(),
+                limit: 10,
+                cursor: None,
+            })
+            .unwrap();
+        let mut labels: Vec<String> = page.hits.into_iter().filter_map(|h| h.label).collect();
+        labels.sort();
+        labels
+    };
+    // inferred type counts; equality, range, in, has, enum
+    assert_eq!(
+        q(&["ex:Organization"], &[]),
+        vec!["ACME Logistics", "Beta Shipping"]
+    );
+    assert_eq!(
+        q(&["ex:Company"], &["ex:country = \"VN\""]),
+        vec!["ACME Logistics"]
+    );
+    assert_eq!(q(&[], &["ex:value >= 1000"]), vec!["HĐ 123"]);
+    assert_eq!(q(&[], &["ex:value < 1000.5"]), vec!["HĐ 7"]);
+    assert_eq!(
+        q(&[], &["ex:country in (\"SG\", \"TH\")"]),
+        vec!["Beta Shipping"]
+    );
+    assert_eq!(q(&["ex:Contract"], &["ex:status = draft"]), vec!["HĐ 7"]);
+    assert_eq!(
+        q(&[], &["has ex:has_contract"]),
+        vec!["ACME Logistics", "Beta Shipping"]
+    );
+    assert_eq!(
+        q(&[], &[&format!("ex:has_contract = {c1}")]),
+        vec!["ACME Logistics", "Beta Shipping"]
+    );
+    assert!(q(&[], &["ex:country = \"JP\""]).is_empty());
+    // bad input is a validation error (exit 2)
+    let err = kb
+        .search(&SearchQuery {
+            wheres: vec!["ex:value >= lots".into()],
+            limit: 10,
+            ..Default::default()
+        })
+        .unwrap_err();
+    assert_eq!(err.exit_code(), 2, "{err}");
+
+    // pagination is stable and complete
+    let page1 = kb
+        .search(&SearchQuery {
+            types: vec!["ex:Organization".into()],
+            limit: 1,
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!((page1.total, page1.next_cursor.as_deref()), (2, Some("1")));
+    let page2 = kb
+        .search(&SearchQuery {
+            types: vec!["ex:Organization".into()],
+            limit: 1,
+            cursor: page1.next_cursor,
+            ..Default::default()
+        })
+        .unwrap();
+    assert!(page2.next_cursor.is_none());
+    assert_ne!(page1.hits[0].iri, page2.hits[0].iri);
+
+    // traverse: contracts of ACME, and who holds contract c1 (inverse path)
+    let names: Vec<String> = kb
+        .traverse(&acme_iri, "ex:has_contract/rdfs:label", 10)
+        .unwrap()
+        .into_iter()
+        .map(|h| h.iri)
+        .collect();
+    assert_eq!(names, vec!["\"HĐ 123\""]);
+    let holders = kb.traverse(&c1, "^ex:has_contract", 10).unwrap();
+    assert_eq!(holders.len(), 2);
+
+    // path: ACME -> c1 <- Beta
+    let steps = kb.path(&acme_iri, &beta_iri, 4).unwrap().unwrap();
+    assert_eq!(steps.len(), 2);
+    assert!(steps[0].forward && !steps[1].forward);
+    assert_eq!(steps[0].p, "ex:has_contract");
+    assert!(kb.path(&acme_iri, &beta_iri, 1).unwrap().is_none());
+
+    // filters survive a rebuild unchanged
+    let fp = kb.fingerprint().unwrap();
+    assert_eq!(kb.rebuild().unwrap().fingerprint, fp);
+    assert_eq!(q(&[], &["ex:value >= 1000"]), vec!["HĐ 123"]);
+}

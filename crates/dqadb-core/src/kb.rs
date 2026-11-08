@@ -218,6 +218,10 @@ impl Kb {
         WriteLock::acquire(&self.events_dir().join(".lock"), self.lock_timeout)
     }
 
+    pub(crate) fn store_handle(&self) -> Result<Arc<Store>> {
+        self.store()
+    }
+
     fn store(&self) -> Result<Arc<Store>> {
         let mut guard = self.store.lock().unwrap();
         if let Some(s) = guard.as_ref() {

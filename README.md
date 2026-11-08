@@ -45,10 +45,10 @@ Exit codes: 0 ok · 1 error · 2 validation · 3 not found · 4 ontology not bui
 
 ## Status (milestone M1)
 
-Done: `init`, `status`, `rebuild`, `verify`, `new-id`, `ontology build|show`, `assert`, `validate`, `retract --event`, `get`, `query` (SPARQL 1.1), `events show|ls`; RDFS subclass inference.
+Done: `init`, `status`, `rebuild`, `verify`, `new-id`, `ontology build|show`, `assert`, `validate`, `retract --event`, `get`, `query` (SPARQL 1.1), `search` (type + `--where` filters), `traverse`, `path`, `events show|ls`; RDFS subclass inference.
 Validation enforces the LinkML schema directly (known predicates/classes, ranges, enums, required, single-valued).
 
-Not yet: SHACL engine on `shapes.ttl`, `props` filter columns and search (M2), web UI (M3).
+Not yet: full-text and vector search (M2), web UI (M3). SHACL: validation runs from LinkML directly; `shapes.ttl` is an export (no runtime SHACL engine until hand-written shapes need one).
 
 ## Index store
 

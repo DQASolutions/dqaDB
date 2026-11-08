@@ -4,6 +4,7 @@ use clap::{Args, Parser, Subcommand};
 use dqadb_core::kb::{Card, EventSummary, WriteResult};
 use dqadb_core::ontology::{InputOp, Range};
 use dqadb_core::rdf::Prefixes;
+use dqadb_core::search::{Hit, SearchQuery};
 use dqadb_core::sparql::{self, Answer, Limits};
 use dqadb_core::{Error, Kb, Result, WriteOpts};
 use std::io::Read;
@@ -108,6 +109,45 @@ enum Cmd {
         /// Seconds before the query is cancelled
         #[arg(long, default_value_t = 10)]
         timeout: u64,
+    },
+    /// Find entities by type and field filters
+    #[command(
+        after_help = "Filters (repeat --where for AND):\n  ex:p = \"text\" | ex:p != \"text\" | ex:p >= 10 | ex:p < 2026-01-01\n  ex:p in (\"A\", \"B\") | ex:p = dqadb:<id> | has ex:p\n\n\
+        Examples:\n  dqadb search --type ex:Company --where 'ex:country = \"VN\"'\n  \
+        dqadb search --type ex:Contract --where 'ex:value >= 10000' --where 'ex:status in (active, draft)'"
+    )]
+    Search {
+        /// Class the entity must have (inferred types count); repeatable
+        #[arg(long = "type")]
+        types: Vec<String>,
+        /// Field filter; repeatable (AND)
+        #[arg(long = "where")]
+        wheres: Vec<String>,
+        #[arg(short = 'k', long, default_value_t = 10)]
+        limit: usize,
+        /// Continue from a previous page
+        #[arg(long)]
+        cursor: Option<String>,
+    },
+    /// Follow a SPARQL property path from an entity
+    #[command(
+        after_help = "Examples:\n  dqadb traverse dqadb:01JC... 'ex:has_contract'\n  \
+        dqadb traverse dqadb:01JC... '^ex:has_contract'          (who points here)\n  \
+        dqadb traverse dqadb:01JC... 'ex:has_contract/rdfs:label'"
+    )]
+    Traverse {
+        iri: String,
+        path: String,
+        #[arg(short = 'k', long, default_value_t = 50)]
+        limit: usize,
+    },
+    /// Shortest chain of entity links between two entities (either direction)
+    #[command(after_help = "Example:\n  dqadb path dqadb:01JC... dqadb:01JD... --max-depth 4")]
+    Path {
+        from: String,
+        to: String,
+        #[arg(long, default_value_t = 4)]
+        max_depth: usize,
     },
     /// Inspect event files
     #[command(subcommand)]
@@ -297,6 +337,37 @@ fn print_card(c: &Card) {
             .map(|e| e.event_id.as_str())
             .unwrap_or("<id>")
     );
+}
+
+fn print_hit(h: &Hit) {
+    let label = h
+        .label
+        .as_deref()
+        .map(|l| format!("  \"{l}\""))
+        .unwrap_or_default();
+    let types: Vec<String> = h
+        .types
+        .iter()
+        .map(|t| {
+            if t.inferred {
+                format!("~{}", t.iri)
+            } else {
+                t.iri.clone()
+            }
+        })
+        .collect();
+    let types = if types.is_empty() {
+        String::new()
+    } else {
+        format!("  [{}]", types.join(", "))
+    };
+    let matched: Vec<String> = h.matched.iter().map(|(p, v)| format!("{p}={v}")).collect();
+    let matched = if matched.is_empty() {
+        String::new()
+    } else {
+        format!("  {}", matched.join(" "))
+    };
+    println!("{}{label}{types}{matched}", h.iri);
 }
 
 /// Tab-separated rows with a header; terms compacted with the KB prefixes.
@@ -570,6 +641,69 @@ fn run(cli: Cli) -> Result<()> {
             }
             let prefixes = kb.ontology()?.prefixes;
             print_answer(&prefixes, &answer);
+        }
+        Cmd::Search {
+            types,
+            wheres,
+            limit,
+            cursor,
+        } => {
+            let page = kb.search(&SearchQuery {
+                types,
+                wheres,
+                limit,
+                cursor,
+            })?;
+            if json {
+                return print_json(&page);
+            }
+            for h in &page.hits {
+                print_hit(h);
+            }
+            match &page.next_cursor {
+                Some(c) => println!(
+                    "{} of {} shown. Next: same command with --cursor {c}",
+                    page.hits.len(),
+                    page.total
+                ),
+                None => println!("{} result(s)", page.total),
+            }
+        }
+        Cmd::Traverse { iri, path, limit } => {
+            let hits = kb.traverse(&iri, &path, limit)?;
+            if json {
+                return print_json(&hits);
+            }
+            hits.iter().for_each(print_hit);
+            println!("{} result(s)", hits.len());
+        }
+        Cmd::Path {
+            from,
+            to,
+            max_depth,
+        } => {
+            let steps = kb.path(&from, &to, max_depth)?;
+            if json {
+                return print_json(&steps);
+            }
+            match steps {
+                Some(steps) if steps.is_empty() => println!("same entity"),
+                Some(steps) => {
+                    for s in &steps {
+                        if s.forward {
+                            println!("{} --{}--> {}", s.from, s.p, s.to);
+                        } else {
+                            println!("{} <--{}-- {}", s.from, s.p, s.to);
+                        }
+                    }
+                    println!("{} hop(s)", steps.len());
+                }
+                None => {
+                    return Err(Error::NotFound(format!(
+                        "no path within {max_depth} hops (rdf:type links are not followed)"
+                    )));
+                }
+            }
         }
         Cmd::Events(EventsCmd::Show { id }) => print_json(&kb.event(&id)?)?,
         Cmd::Events(EventsCmd::Ls {

@@ -54,7 +54,7 @@ pub fn to_ox(t: &Term) -> OxTerm {
     }
 }
 
-fn from_ox(t: &OxTerm) -> Option<Term> {
+pub fn from_ox(t: &OxTerm) -> Option<Term> {
     match t {
         OxTerm::NamedNode(n) => Some(Term::Iri(n.as_str().to_string())),
         OxTerm::Literal(l) => Some(match l.language() {

@@ -29,8 +29,8 @@ use crate::rdf::{self, Term};
 use crate::{Error, Result};
 
 /// Bump when the layout changes; a mismatch forces `dqadb rebuild`.
-/// 3: SQLite backend (1-2 were LMDB).
-pub const STORE_FORMAT: u32 = 3;
+/// 3: SQLite backend (1-2 were LMDB). 4: `props` table for typed literal filters.
+pub const STORE_FORMAT: u32 = 4;
 const PAGE: i64 = 1024;
 const BUSY_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -45,6 +45,11 @@ CREATE TABLE IF NOT EXISTS pos(a INTEGER NOT NULL, b INTEGER NOT NULL, c INTEGER
 CREATE TABLE IF NOT EXISTS osp(a INTEGER NOT NULL, b INTEGER NOT NULL, c INTEGER NOT NULL, PRIMARY KEY(a,b,c)) WITHOUT ROWID;
 CREATE TABLE IF NOT EXISTS prov(a INTEGER NOT NULL, b INTEGER NOT NULL, c INTEGER NOT NULL, ev BLOB NOT NULL, PRIMARY KEY(a,b,c,ev)) WITHOUT ROWID;
 CREATE TABLE IF NOT EXISTS inf(a INTEGER NOT NULL, b INTEGER NOT NULL, c INTEGER NOT NULL, PRIMARY KEY(a,b,c)) WITHOUT ROWID;
+-- every literal-valued triple, with a comparable key: num for numbers, booleans,
+-- dates (days since epoch) and date-times (seconds since epoch); txt for strings
+CREATE TABLE IF NOT EXISTS props(p INTEGER NOT NULL, s INTEGER NOT NULL, o INTEGER NOT NULL, num REAL, txt TEXT, PRIMARY KEY(p,s,o)) WITHOUT ROWID;
+CREATE INDEX IF NOT EXISTS props_num ON props(p, num) WHERE num IS NOT NULL;
+CREATE INDEX IF NOT EXISTS props_txt ON props(p, txt) WHERE txt IS NOT NULL;
 ";
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -63,6 +68,70 @@ pub struct ApplyStats {
     pub added: u64,
     pub retracted: u64,
     pub noop: u64,
+}
+
+/// Comparison in a `--where` filter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CmpOp {
+    Eq,
+    Ne,
+    Lt,
+    Le,
+    Gt,
+    Ge,
+}
+
+impl CmpOp {
+    fn sql(self) -> &'static str {
+        match self {
+            CmpOp::Eq => "=",
+            CmpOp::Ne => "<>",
+            CmpOp::Lt => "<",
+            CmpOp::Le => "<=",
+            CmpOp::Gt => ">",
+            CmpOp::Ge => ">=",
+        }
+    }
+}
+
+/// A condition on one predicate's values.
+#[derive(Debug, Clone, PartialEq)]
+pub enum PropCond {
+    /// the subject has any value for the predicate
+    Has,
+    /// value is this IRI (dictionary id)
+    Iri(Id),
+    Num(CmpOp, f64),
+    Txt(CmpOp, String),
+}
+
+/// Comparable key of a literal for the `props` table: (num, txt).
+pub fn literal_key(l: &rdf::Literal) -> (Option<f64>, Option<String>) {
+    if l.language.is_some() {
+        return (None, Some(l.value.clone()));
+    }
+    let local = l
+        .datatype
+        .as_deref()
+        .and_then(|d| d.strip_prefix(rdf::XSD))
+        .unwrap_or("string");
+    match local {
+        "integer" | "decimal" | "double" | "float" | "int" | "long" => (l.value.parse().ok(), None),
+        "boolean" => (Some(if l.value == "true" { 1.0 } else { 0.0 }), None),
+        "date" => (
+            chrono::NaiveDate::parse_from_str(&l.value, "%Y-%m-%d")
+                .ok()
+                .map(|d| (d - chrono::NaiveDate::default()).num_days() as f64),
+            None,
+        ),
+        "dateTime" => (
+            chrono::DateTime::parse_from_rfc3339(&l.value)
+                .ok()
+                .map(|d| d.timestamp() as f64),
+            None,
+        ),
+        _ => (None, Some(l.value.clone())),
+    }
 }
 
 /// Index permutation; each table stores (a, b, c) in its own order.
@@ -266,6 +335,7 @@ impl Store {
             "SELECT a, b, c, NULL FROM spo ORDER BY a, b, c",
             "SELECT a, b, c, ev FROM prov ORDER BY a, b, c, ev",
             "SELECT a, b, c, NULL FROM inf ORDER BY a, b, c",
+            "SELECT p, s, o, NULL FROM props ORDER BY p, s, o",
         ] {
             h.update(b"|");
             let mut st = r.conn.prepare(sql)?;
@@ -455,6 +525,46 @@ impl Reader<'_> {
             .is_some())
     }
 
+    /// Subjects whose value for `p` satisfies `cond`, ascending and distinct.
+    pub fn subjects_where(&self, p: Id, cond: &PropCond) -> Result<Vec<Id>> {
+        let ids = |st: &mut rusqlite::CachedStatement<'_>,
+                   args: &[&dyn rusqlite::ToSql]|
+         -> Result<Vec<Id>> {
+            let rows = st.query_map(args, |r| r.get::<_, i64>(0))?;
+            Ok(rows
+                .map(|v| v.map(|v| v as Id))
+                .collect::<std::result::Result<_, _>>()?)
+        };
+        match cond {
+            PropCond::Has => {
+                let mut st = self
+                    .conn
+                    .prepare_cached("SELECT DISTINCT c FROM pos WHERE a = ?1 ORDER BY c")?;
+                ids(&mut st, &[&i(p)])
+            }
+            PropCond::Iri(o) => {
+                let mut st = self
+                    .conn
+                    .prepare_cached("SELECT c FROM pos WHERE a = ?1 AND b = ?2 ORDER BY c")?;
+                ids(&mut st, &[&i(p), &i(*o)])
+            }
+            PropCond::Num(op, v) => {
+                let sql = format!(
+                    "SELECT DISTINCT s FROM props WHERE p = ?1 AND num {} ?2 ORDER BY s",
+                    op.sql()
+                );
+                ids(&mut self.conn.prepare_cached(&sql)?, &[&i(p), v])
+            }
+            PropCond::Txt(op, v) => {
+                let sql = format!(
+                    "SELECT DISTINCT s FROM props WHERE p = ?1 AND txt {} ?2 ORDER BY s",
+                    op.sql()
+                );
+                ids(&mut self.conn.prepare_cached(&sql)?, &[&i(p), v])
+            }
+        }
+    }
+
     fn has_prov(&self, s: Id, p: Id, o: Id) -> Result<bool> {
         Ok(self
             .conn
@@ -553,6 +663,13 @@ impl<'a> Batch<'a> {
             params![i(s), i(p), i(o)],
         )? == 1
         {
+            if let Term::Literal(l) = self.r().term(o)? {
+                let (num, txt) = literal_key(&l);
+                self.exec(
+                    "INSERT INTO props VALUES (?1, ?2, ?3, ?4, ?5)",
+                    params![i(p), i(s), i(o), num, txt],
+                )?;
+            }
             self.exec(
                 "INSERT INTO pos VALUES (?1, ?2, ?3)",
                 params![i(p), i(o), i(s)],
@@ -575,6 +692,10 @@ impl<'a> Batch<'a> {
             self.exec(
                 "DELETE FROM pos WHERE a = ?1 AND b = ?2 AND c = ?3",
                 params![i(p), i(o), i(s)],
+            )?;
+            self.exec(
+                "DELETE FROM props WHERE p = ?1 AND s = ?2 AND o = ?3",
+                params![i(p), i(s), i(o)],
             )?;
             self.exec(
                 "DELETE FROM osp WHERE a = ?1 AND b = ?2 AND c = ?3",
