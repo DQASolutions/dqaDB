@@ -114,6 +114,37 @@ pub struct Ontology {
     pub hash: String,
 }
 
+/// RDFS rules the index materialises: `rdf:type` along `rdfs:subClassOf` (LinkML `is_a`).
+/// Domain/range are not used for entailment: in LinkML they are constraints, and inferring
+/// types from them would hide data errors that validation should report.
+#[derive(Debug, Clone, Default)]
+pub struct Inference {
+    /// class IRI -> proper ancestors, nearest first
+    ancestors: BTreeMap<String, Vec<String>>,
+    /// changes whenever the rules change; stored in the index to detect stale inferences
+    pub hash: String,
+}
+
+impl Inference {
+    pub fn new(ancestors: BTreeMap<String, Vec<String>>) -> Self {
+        let mut h = Sha256::new();
+        for (c, a) in &ancestors {
+            h.update(format!("{c} < {}\n", a.join(" ")));
+        }
+        Self {
+            ancestors,
+            hash: format!("sha256:{}", hex::encode(h.finalize())),
+        }
+    }
+
+    pub fn superclasses(&self, class_iri: &str) -> &[String] {
+        self.ancestors
+            .get(class_iri)
+            .map(Vec::as_slice)
+            .unwrap_or_default()
+    }
+}
+
 /// Input op as written by an agent: CURIEs, `_:tmp` placeholders and plain JSON values allowed.
 #[derive(Debug, Clone, Deserialize)]
 pub struct InputOp {
@@ -361,6 +392,26 @@ impl Ontology {
             enums,
             hash,
         })
+    }
+
+    /// RDFS entailment rules derived from the schema (spec §7).
+    pub fn inference(&self) -> Inference {
+        let ancestors: BTreeMap<String, Vec<String>> = self
+            .classes
+            .keys()
+            .map(|c| {
+                (
+                    c.clone(),
+                    self.lineage(c)
+                        .iter()
+                        .skip(1)
+                        .map(|a| a.iri.clone())
+                        .collect(),
+                )
+            })
+            .filter(|(_, a): &(String, Vec<String>)| !a.is_empty())
+            .collect();
+        Inference::new(ancestors)
     }
 
     /// The class and all its ancestors (is_a chain).

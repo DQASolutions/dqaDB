@@ -119,6 +119,11 @@ impl Prefixes {
         self.map.keys().map(String::as_str).collect()
     }
 
+    /// (prefix, namespace) pairs, sorted by prefix.
+    pub fn pairs(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.map.iter().map(|(p, ns)| (p.as_str(), ns.as_str()))
+    }
+
     /// Accepts `prefix:local`, `<absolute-iri>`, `http(s)://...` or `urn:...`.
     pub fn expand(&self, input: &str) -> Result<String, String> {
         let s = input.trim();

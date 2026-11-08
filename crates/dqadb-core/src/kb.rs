@@ -12,8 +12,9 @@ use ulid::Ulid;
 use crate::config::{CONFIG_FILE, Config};
 use crate::event::{self, EVENT_SCHEMA, Event, Op, OpKind, Source};
 use crate::lock::WriteLock;
-use crate::ontology::{self, InputOp, Ontology};
+use crate::ontology::{self, Inference, InputOp, Ontology};
 use crate::rdf::{self, Term};
+use crate::sparql;
 use crate::store::{Counts, STORE_FORMAT, Store};
 use crate::{Error, Result};
 
@@ -118,11 +119,18 @@ pub struct PropValue {
     pub is_iri: bool,
 }
 
+/// A type of an entity; `inferred` = entailed by RDFS only, never asserted by an event.
+#[derive(Debug, Serialize, PartialEq, Eq)]
+pub struct TypeRef {
+    pub iri: String,
+    pub inferred: bool,
+}
+
 #[derive(Debug, Serialize)]
 pub struct Card {
     pub iri: String,
     pub label: Option<String>,
-    pub types: Vec<String>,
+    pub types: Vec<TypeRef>,
     pub props: Vec<PropValue>,
     pub incoming: Vec<PropValue>,
     pub incoming_total: usize,
@@ -251,21 +259,32 @@ impl Kb {
     /// and copied in). Called before every read so answers never lag the files.
     pub fn sync(&self) -> Result<usize> {
         let store = self.store()?;
-        let wm = store.watermark(&*store.read_txn()?)?;
+        let inference = self.ontology()?.inference();
+        let (wm, rules) = {
+            let r = store.read_txn()?;
+            (store.watermark(&r)?, store.inference_hash(&r)?)
+        };
         let latest = event::latest(&self.events_dir())?;
-        if latest.is_none() || latest <= wm {
+        if latest <= wm && rules.as_deref() == Some(inference.hash.as_str()) {
             return Ok(0);
         }
         let _lock = self.lock()?;
-        let n = self.sync_locked(&store)?;
+        let n = self.sync_locked(&store, &inference)?;
         self.write_manifest(&store, None)?;
         Ok(n)
     }
 
-    fn sync_locked(&self, store: &Store) -> Result<usize> {
-        let wm = store.watermark(&*store.read_txn()?)?;
+    fn sync_locked(&self, store: &Store, inference: &Inference) -> Result<usize> {
+        let (wm, rules) = {
+            let r = store.read_txn()?;
+            (store.watermark(&r)?, store.inference_hash(&r)?)
+        };
         let files = event::list_after(&self.events_dir(), wm)?;
-        replay(store, &files)
+        if files.is_empty() && rules.as_deref() != Some(inference.hash.as_str()) {
+            // ontology hierarchy changed: opening a batch recomputes inferences
+            store.batch(inference)?.commit()?;
+        }
+        replay(store, &files, inference)
     }
 
     /// Rebuild `.dqadb/` from scratch into a temp dir, then swap it in.
@@ -279,9 +298,11 @@ impl Kb {
             std::fs::remove_dir_all(&tmp_root)?;
         }
         let files = event::list_after(&self.events_dir(), None)?;
+        let inference = self.ontology()?.inference();
         let (counts, fingerprint) = {
             let store = Store::open(&tmp)?;
-            replay(&store, &files)?;
+            replay(&store, &files, &inference)?;
+            store.batch(&inference)?.commit()?;
             let counts = store.counts(&*store.read_txn()?)?;
             let fp = store.fingerprint()?;
             store.close();
@@ -349,10 +370,11 @@ impl Kb {
         let hash = ontology::check_fresh(&self.ontology_dir(), &self.generated_dir())?;
         let onto = self.ontology()?;
         let store = self.store()?;
-        self.sync_locked(&store)?;
+        let inference = onto.inference();
+        self.sync_locked(&store, &inference)?;
         let latest = self.check_expected(opts)?;
 
-        let batch = store.batch()?;
+        let batch = store.batch(&inference)?;
         let base = self.config.base_iri.clone();
         let mut mint = || format!("{base}{}", Ulid::generate());
         let existing = |s: &str, p: &str| batch.values(s, p).unwrap_or_default();
@@ -399,9 +421,10 @@ impl Kb {
             )));
         }
         let store = self.store()?;
-        self.sync_locked(&store)?;
+        let inference = self.ontology()?.inference();
+        self.sync_locked(&store, &inference)?;
         let latest = self.check_expected(opts)?;
-        let batch = store.batch()?;
+        let batch = store.batch(&inference)?;
         let mut opts = opts.clone();
         opts.note = Some(format!("retract event {event_id}: {why}"));
         self.commit(
@@ -649,10 +672,14 @@ impl Kb {
         for (p, o) in &out {
             let p_term = store.term(&r, *p)?;
             let o_term = store.term(&r, *o)?;
-            last = last.max(store.provenance(&r, sid, *p, *o)?.into_iter().max());
+            let prov = store.provenance(&r, sid, *p, *o)?;
+            last = last.max(prov.iter().copied().max());
             let p_iri = p_term.as_iri().unwrap_or_default();
             if p_iri == rdf::RDF_TYPE {
-                card.types.push(onto.prefixes.display(&o_term));
+                card.types.push(TypeRef {
+                    iri: onto.prefixes.display(&o_term),
+                    inferred: prov.is_empty(),
+                });
                 continue;
             }
             if p_iri == rdf::RDFS_LABEL {
@@ -687,6 +714,23 @@ impl Kb {
     pub fn fingerprint(&self) -> Result<String> {
         self.store()?.fingerprint()
     }
+
+    /// Run a SPARQL 1.1 query. The KB's prefixes are predeclared.
+    pub fn query(&self, query: &str, limits: &sparql::Limits) -> Result<sparql::Answer> {
+        self.sync()?;
+        let onto = self.ontology()?;
+        let store = self.store()?;
+        let txn = store.read_txn()?;
+        let event_ns = self.event_namespace();
+        let events_dir = self.events_dir();
+        let dataset = sparql::KbDataset::new(&store, &txn, &event_ns, &events_dir);
+        sparql::run(dataset, &onto.prefixes, query, limits)
+    }
+
+    /// Named graph IRI prefix for events: `<base_iri>event:`.
+    pub fn event_namespace(&self) -> String {
+        format!("{}event:", self.config.base_iri)
+    }
 }
 
 fn values(store: &Store, r: &heed::RoTxn, s: &str, p: &str) -> Result<Vec<Term>> {
@@ -713,13 +757,13 @@ fn next_ulid(latest: Option<Ulid>) -> Ulid {
 }
 
 /// Parse files in parallel, apply strictly in ULID order, commit per chunk.
-fn replay(store: &Store, files: &[(Ulid, PathBuf)]) -> Result<usize> {
+fn replay(store: &Store, files: &[(Ulid, PathBuf)], inference: &Inference) -> Result<usize> {
     for chunk in files.chunks(REPLAY_CHUNK) {
         let events: Vec<Event> = chunk
             .par_iter()
             .map(|(_, p)| event::read_event(p))
             .collect::<Result<_>>()?;
-        let mut batch = store.batch()?;
+        let mut batch = store.batch(inference)?;
         for ((id, path), ev) in chunk.iter().zip(&events) {
             if ev.event_id != id.to_string() {
                 return Err(Error::other(format!(

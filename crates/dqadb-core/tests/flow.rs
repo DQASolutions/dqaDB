@@ -1,4 +1,5 @@
 use dqadb_core::ontology::InputOp;
+use dqadb_core::sparql::{self, Answer, Limits};
 use dqadb_core::{Error, Kb, WriteOpts};
 
 fn ops(json: serde_json::Value) -> Vec<InputOp> {
@@ -42,7 +43,15 @@ fn assert_get_retract_and_rebuild_is_deterministic() {
 
     let card = kb.get(&acme_iri).unwrap();
     assert_eq!(card.label.as_deref(), Some("ACME Logistics"));
-    assert_eq!(card.types, vec!["ex:Company"]);
+    let types: Vec<(&str, bool)> = card
+        .types
+        .iter()
+        .map(|t| (t.iri.as_str(), t.inferred))
+        .collect();
+    assert_eq!(
+        types,
+        vec![("ex:Company", false), ("ex:Organization", true)]
+    );
     let contract = card
         .props
         .iter()
@@ -164,4 +173,138 @@ fn retract_event_and_expected_version() {
     let acme_iri = first.id_map["_:acme"].replace("urn:dqadb:", "dqadb:");
     assert_eq!(kb.get(&acme_iri).unwrap_err().exit_code(), 3);
     assert_eq!(kb.status().unwrap().counts.triples, 0);
+}
+
+fn select(kb: &Kb, q: &str) -> Vec<Vec<String>> {
+    let prefixes = kb.ontology().unwrap().prefixes;
+    match kb.query(q, &Limits::default()).unwrap() {
+        Answer::Solutions { rows, .. } => rows
+            .iter()
+            .map(|r| {
+                r.iter()
+                    .map(|t| {
+                        t.as_ref()
+                            .map(|t| sparql::display(&prefixes, t))
+                            .unwrap_or_default()
+                    })
+                    .collect()
+            })
+            .collect(),
+        other => panic!("expected solutions, got {other:?}"),
+    }
+}
+
+#[test]
+fn rdfs_subclass_inference_follows_types_and_ontology() {
+    let (dir, kb) = new_kb();
+    let res = kb.assert(&acme(), &opts()).unwrap();
+    let acme_iri = res.id_map["_:acme"].replace("urn:dqadb:", "dqadb:");
+
+    // ex:Company is_a ex:Organization -> inferred type, queryable via SPARQL
+    let orgs = select(&kb, "SELECT ?o WHERE { ?o a ex:Organization }");
+    assert_eq!(orgs, vec![vec![acme_iri.clone()]]);
+    assert_eq!(kb.status().unwrap().counts.inferred, 1);
+
+    // inferred facts never land in event files
+    let ev = kb.event(&res.event_id).unwrap();
+    assert!(
+        ev.ops.iter().all(
+            |o| !matches!(&o.o, dqadb_core::rdf::Term::Iri(i) if i.ends_with("#Organization"))
+        )
+    );
+
+    // a contract becomes an organization once the hierarchy says so (no new events)
+    let schema = dir.path().join("ontology/schema.linkml.yaml");
+    let text = std::fs::read_to_string(&schema).unwrap();
+    std::fs::write(
+        &schema,
+        text.replace("  Contract:\n", "  Contract:\n    is_a: Organization\n"),
+    )
+    .unwrap();
+    kb.build_ontology(true).unwrap();
+    assert_eq!(
+        select(
+            &kb,
+            "SELECT (COUNT(*) AS ?n) WHERE { ?o a ex:Organization }"
+        ),
+        vec![vec!["2".to_string()]]
+    );
+    let incremental = kb.fingerprint().unwrap();
+    assert_eq!(
+        kb.rebuild().unwrap().fingerprint,
+        incremental,
+        "re-inference must equal a full rebuild"
+    );
+
+    // retracting the asserted type removes what was inferred from it
+    kb.assert(&ops(serde_json::json!([{"op": "retract", "s": acme_iri, "p": "rdf:type", "o": "ex:Company"}])), &opts()).unwrap();
+    let types = kb.get(&acme_iri).unwrap().types;
+    assert!(types.is_empty(), "{types:?}");
+    assert_eq!(kb.rebuild().unwrap().fingerprint, kb.fingerprint().unwrap());
+}
+
+#[test]
+fn sparql_select_filter_ask_graph_and_errors() {
+    let (_dir, kb) = new_kb();
+    let res = kb.assert(&acme(), &opts()).unwrap();
+    kb.assert(
+        &ops(serde_json::json!([
+            {"op": "add", "s": "_:c2", "p": "rdf:type", "o": "ex:Contract"},
+            {"op": "add", "s": "_:c2", "p": "rdfs:label", "o": "HĐ 7"},
+            {"op": "add", "s": "_:c2", "p": "ex:value", "o": 900}
+        ])),
+        &opts(),
+    )
+    .unwrap();
+
+    let rows = select(
+        &kb,
+        "SELECT ?label ?v WHERE { ?c a ex:Contract ; rdfs:label ?label ; ex:value ?v FILTER(?v > 1000) }",
+    );
+    assert_eq!(
+        rows,
+        vec![vec!["\"HĐ 123\"".to_string(), "50000".to_string()]]
+    );
+
+    // property path + language-tagged label
+    let rows = select(
+        &kb,
+        "SELECT ?name WHERE { ?org ex:has_contract/ex:status \"active\" ; rdfs:label ?name }",
+    );
+    assert_eq!(rows, vec![vec!["\"ACME Logistics\"@vi".to_string()]]);
+
+    // provenance: which event asserted the country
+    let rows = select(&kb, "SELECT ?g WHERE { GRAPH ?g { ?s ex:country \"VN\" } }");
+    assert_eq!(rows, vec![vec![format!("dqadb:event:{}", res.event_id)]]);
+    let g = format!("<urn:dqadb:event:{}>", res.event_id);
+    let n = select(
+        &kb,
+        &format!("SELECT (COUNT(*) AS ?n) WHERE {{ GRAPH {g} {{ ?s ?p ?o }} }}"),
+    );
+    assert_eq!(n, vec![vec!["8".to_string()]]);
+
+    match kb
+        .query("ASK { ?x a ex:Company }", &Limits::default())
+        .unwrap()
+    {
+        Answer::Boolean(b) => assert!(b),
+        other => panic!("{other:?}"),
+    }
+    let limited = kb
+        .query(
+            "SELECT ?s ?p ?o WHERE { ?s ?p ?o }",
+            &Limits {
+                rows: 3,
+                ..Limits::default()
+            },
+        )
+        .unwrap();
+    assert!(
+        matches!(limited, Answer::Solutions { truncated: true, ref rows, .. } if rows.len() == 3)
+    );
+
+    let err = kb
+        .query("SELECT ?x WHERE { ?x a }", &Limits::default())
+        .unwrap_err();
+    assert_eq!(err.exit_code(), 2);
 }

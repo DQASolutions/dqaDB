@@ -8,6 +8,7 @@ pub mod kb;
 pub mod lock;
 pub mod ontology;
 pub mod rdf;
+pub mod sparql;
 pub mod store;
 
 pub use error::{Error, Result};

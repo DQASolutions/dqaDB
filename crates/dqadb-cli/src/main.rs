@@ -3,6 +3,8 @@
 use clap::{Args, Parser, Subcommand};
 use dqadb_core::kb::{Card, EventSummary, WriteResult};
 use dqadb_core::ontology::{InputOp, Range};
+use dqadb_core::rdf::Prefixes;
+use dqadb_core::sparql::{self, Answer, Limits};
 use dqadb_core::{Error, Kb, Result, WriteOpts};
 use std::io::Read;
 use std::path::PathBuf;
@@ -86,8 +88,27 @@ enum Cmd {
         after_help = "Examples:\n  dqadb get dqadb:01JC9Y...\n  dqadb get dqadb:01JC9Y... --json"
     )]
     Get { iri: String },
-    /// SPARQL query (not implemented yet: milestone M1)
-    Query { sparql: Option<String> },
+    /// SPARQL 1.1 query over the current state (asserted + inferred facts)
+    #[command(
+        after_help = "KB prefixes (ex:, dqadb:, rdf:, rdfs:, xsd:, owl:) are predeclared.\n\
+        Named graph dqadb:event:<ULID> holds what that event asserted (provenance).\n\n\
+        Examples:\n  dqadb query 'SELECT ?c ?v WHERE { ?c a ex:Contract ; ex:value ?v FILTER(?v > 10000) }'\n  \
+        dqadb query 'SELECT ?g WHERE { GRAPH ?g { ?s ex:country \"VN\" } }'\n  \
+        dqadb query -f q.rq --limit 100 --json"
+    )]
+    Query {
+        /// Query text (or use -f)
+        sparql: Option<String>,
+        /// Read the query from a file ('-' = stdin)
+        #[arg(short, long, conflicts_with = "sparql")]
+        file: Option<PathBuf>,
+        /// Maximum rows returned
+        #[arg(long, default_value_t = 1000)]
+        limit: usize,
+        /// Seconds before the query is cancelled
+        #[arg(long, default_value_t = 10)]
+        timeout: u64,
+    },
     /// Inspect event files
     #[command(subcommand)]
     Events(EventsCmd),
@@ -223,7 +244,18 @@ fn print_card(c: &Card) {
         .as_deref()
         .map(|l| format!("  \"{l}\""))
         .unwrap_or_default();
-    println!("{}{label}  [{}]", c.iri, c.types.join(", "));
+    let types: Vec<String> = c
+        .types
+        .iter()
+        .map(|t| {
+            if t.inferred {
+                format!("~{}", t.iri)
+            } else {
+                t.iri.clone()
+            }
+        })
+        .collect();
+    println!("{}{label}  [{}]", c.iri, types.join(", "));
     let width = c.props.iter().map(|p| p.p.len()).max().unwrap_or(0);
     for p in &c.props {
         let label = p
@@ -265,6 +297,55 @@ fn print_card(c: &Card) {
             .map(|e| e.event_id.as_str())
             .unwrap_or("<id>")
     );
+}
+
+/// Tab-separated rows with a header; terms compacted with the KB prefixes.
+fn print_answer(prefixes: &Prefixes, answer: &Answer) {
+    match answer {
+        Answer::Boolean(b) => println!("{b}"),
+        Answer::Solutions {
+            vars,
+            rows,
+            truncated,
+        } => {
+            println!(
+                "{}",
+                vars.iter()
+                    .map(|v| format!("?{v}"))
+                    .collect::<Vec<_>>()
+                    .join("\t")
+            );
+            for row in rows {
+                let cells: Vec<String> = row
+                    .iter()
+                    .map(|t| {
+                        t.as_ref()
+                            .map(|t| sparql::display(prefixes, t))
+                            .unwrap_or_default()
+                    })
+                    .collect();
+                println!("{}", cells.join("\t"));
+            }
+            let more = if *truncated {
+                " (truncated: raise --limit or add LIMIT/filters)"
+            } else {
+                ""
+            };
+            println!("{} row(s){more}", rows.len());
+        }
+        Answer::Graph { triples, truncated } => {
+            for t in triples {
+                println!(
+                    "{} {} {} .",
+                    sparql::display(prefixes, &t.subject.clone().into()),
+                    sparql::display(prefixes, &t.predicate.clone().into()),
+                    sparql::display(prefixes, &t.object)
+                );
+            }
+            let more = if *truncated { " (truncated)" } else { "" };
+            println!("{} triple(s){more}", triples.len());
+        }
+    }
 }
 
 fn print_events(json: bool, list: &[EventSummary]) -> Result<()> {
@@ -321,7 +402,10 @@ fn run(cli: Cli) -> Result<()> {
                 s.counts.events,
                 s.latest_event.as_deref().unwrap_or("none")
             );
-            println!("triples    {}", s.counts.triples);
+            println!(
+                "triples    {} ({} inferred)",
+                s.counts.triples, s.counts.inferred
+            );
             println!("terms      {}", s.counts.terms);
             println!(
                 "index      {}",
@@ -460,10 +544,32 @@ fn run(cli: Cli) -> Result<()> {
             }
             print_card(&card);
         }
-        Cmd::Query { .. } => {
-            return Err(Error::other(
-                "SPARQL is not implemented yet (milestone M1). Use: dqadb get <iri>",
-            ));
+        Cmd::Query {
+            sparql,
+            file,
+            limit,
+            timeout,
+        } => {
+            let text = match (sparql, file) {
+                (Some(q), _) => q,
+                (None, Some(f)) if f.as_os_str() == "-" => {
+                    let mut s = String::new();
+                    std::io::stdin().read_to_string(&mut s)?;
+                    s
+                }
+                (None, Some(f)) => std::fs::read_to_string(f)?,
+                (None, None) => return Err(Error::other("pass a query string or -f <file>")),
+            };
+            let limits = Limits {
+                rows: limit,
+                timeout: std::time::Duration::from_secs(timeout),
+            };
+            let answer = kb.query(&text, &limits)?;
+            if json {
+                return print_json(&sparql::to_json(&answer));
+            }
+            let prefixes = kb.ontology()?.prefixes;
+            print_answer(&prefixes, &answer);
         }
         Cmd::Events(EventsCmd::Show { id }) => print_json(&kb.event(&id)?)?,
         Cmd::Events(EventsCmd::Ls {
