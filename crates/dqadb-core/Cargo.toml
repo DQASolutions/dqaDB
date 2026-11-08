@@ -1,0 +1,22 @@
+[package]
+name = "dqadb-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+chrono = { version = "0.4.45", default-features = false, features = ["std", "clock"] }
+heed = "0.22"
+hex = "0.4.3"
+oxrdf = "0.3.5"
+rayon = "1.12.0"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+serde_yaml = "0.9.34"
+sha2 = "0.11.1"
+thiserror = "2.0.21"
+ulid = "3.0.0"
+
+[dev-dependencies]
+tempfile = "3.27.0"

@@ -1,0 +1,52 @@
+# Sample ontology created by `dqadb init`. Edit freely, then run: dqadb ontology build
+id: https://example.org/ont/company
+name: company
+prefixes:
+  ex: https://example.org/ont#
+  linkml: https://w3id.org/linkml/
+default_prefix: ex
+default_range: string
+imports:
+  - linkml:types
+
+classes:
+  Organization:
+    description: A company, agency or other organisation.
+    slots: [label, description, country]
+  Company:
+    is_a: Organization
+    slots: [has_contract]
+  Contract:
+    slots: [label, value, status]
+
+slots:
+  label:
+    slot_uri: rdfs:label
+    required: true
+    annotations:
+      dqadb_index: fts,card
+  description:
+    annotations:
+      dqadb_index: fts,vector
+  country:
+    description: ISO 3166-1 alpha-2 country code.
+    annotations:
+      dqadb_index: filter
+  has_contract:
+    range: Contract
+    multivalued: true
+  value:
+    range: decimal
+    annotations:
+      dqadb_index: filter
+  status:
+    range: ContractStatus
+    annotations:
+      dqadb_index: filter
+
+enums:
+  ContractStatus:
+    permissible_values:
+      draft:
+      active:
+      ended:

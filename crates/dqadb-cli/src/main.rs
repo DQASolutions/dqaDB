@@ -1,0 +1,505 @@
+//! `dqadb` — the CLI harness for agents and people (spec §12).
+
+use clap::{Args, Parser, Subcommand};
+use dqadb_core::kb::{Card, EventSummary, WriteResult};
+use dqadb_core::ontology::{InputOp, Range};
+use dqadb_core::{Error, Kb, Result, WriteOpts};
+use std::io::Read;
+use std::path::PathBuf;
+use std::process::ExitCode;
+
+#[derive(Parser)]
+#[command(
+    name = "dqadb",
+    version,
+    about = "dqaDB: ontology graph DB for AI agents. Files are the source of truth; the index is rebuildable."
+)]
+struct Cli {
+    /// Knowledge base directory (default: search upwards from the current directory)
+    #[arg(long, global = true, env = "DQADB_KB")]
+    kb: Option<PathBuf>,
+    /// Machine-readable JSON output
+    #[arg(long, global = true)]
+    json: bool,
+    #[command(subcommand)]
+    cmd: Cmd,
+}
+
+#[derive(Subcommand)]
+enum Cmd {
+    /// Create a knowledge base: dqadb.yaml, folders and a sample ontology
+    #[command(after_help = "Examples:\n  dqadb init my-kb\n  dqadb init . --base-iri urn:dqadb:")]
+    Init {
+        #[arg(default_value = ".")]
+        path: PathBuf,
+        #[arg(long, default_value = dqadb_core::config::DEFAULT_BASE_IRI)]
+        base_iri: String,
+    },
+    /// Counts, watermark, and whether the index is in sync with the event files
+    Status,
+    /// Delete and rebuild the derived index (.dqadb/) from events
+    Rebuild,
+    /// Check every event file (parse, name, sharded path)
+    Verify,
+    /// Mint new entity IRIs
+    #[command(after_help = "Examples:\n  dqadb new-id\n  dqadb new-id -n 5")]
+    NewId {
+        #[arg(short, default_value_t = 1)]
+        n: usize,
+    },
+    /// Ontology (LinkML) commands
+    #[command(subcommand)]
+    Ontology(OntologyCmd),
+    /// Validate ops and append them as one event
+    #[command(
+        after_help = "Input: a JSON array of ops, or {\"ops\": [...], \"note\": \"...\"}.\n\
+        Op: {\"op\": \"add\"|\"retract\", \"s\": IRI, \"p\": IRI, \"o\": IRI or literal}. Use _:name for new entities.\n\n\
+        Examples:\n  dqadb assert -f facts.json --source contract-123.pdf --actor agent:extractor\n  \
+        echo '[{\"op\":\"add\",\"s\":\"_:a\",\"p\":\"rdf:type\",\"o\":\"ex:Company\"},{\"op\":\"add\",\"s\":\"_:a\",\"p\":\"rdfs:label\",\"o\":\"ACME\"}]' | dqadb assert -f -"
+    )]
+    Assert {
+        #[command(flatten)]
+        input: InputArgs,
+        #[command(flatten)]
+        write: WriteArgs,
+    },
+    /// Dry-run validation: report issues, write nothing
+    #[command(after_help = "Example:\n  dqadb validate -f facts.json")]
+    Validate {
+        #[command(flatten)]
+        input: InputArgs,
+    },
+    /// Retract every triple added by an earlier event
+    #[command(
+        after_help = "Example:\n  dqadb retract --event 01JC9X2K4M0A7Q8R3T5V6W7Y8Z --why \"wrong extraction\""
+    )]
+    Retract {
+        #[arg(long)]
+        event: String,
+        #[arg(long)]
+        why: String,
+        #[command(flatten)]
+        write: WriteArgs,
+    },
+    /// Entity card: types, properties, neighbours, provenance
+    #[command(
+        after_help = "Examples:\n  dqadb get dqadb:01JC9Y...\n  dqadb get dqadb:01JC9Y... --json"
+    )]
+    Get { iri: String },
+    /// SPARQL query (not implemented yet: milestone M1)
+    Query { sparql: Option<String> },
+    /// Inspect event files
+    #[command(subcommand)]
+    Events(EventsCmd),
+}
+
+#[derive(Subcommand)]
+enum OntologyCmd {
+    /// Generate TTL + SHACL from LinkML and write build.lock
+    Build {
+        /// Only record the schema hash; skip gen-owl/gen-shacl (no Python needed)
+        #[arg(long)]
+        lock_only: bool,
+    },
+    /// List classes and predicates (call this before writing)
+    #[command(
+        after_help = "Examples:\n  dqadb ontology show\n  dqadb ontology show --class ex:Contract"
+    )]
+    Show {
+        #[arg(long)]
+        class: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum EventsCmd {
+    /// Print one event file
+    Show { id: String },
+    /// Newest events first
+    Ls {
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+        #[arg(long)]
+        actor: Option<String>,
+        /// YYYY-MM-DD (inclusive)
+        #[arg(long)]
+        since: Option<String>,
+    },
+}
+
+#[derive(Args)]
+struct InputArgs {
+    /// Ops file (JSON); '-' reads stdin
+    #[arg(short, long)]
+    file: PathBuf,
+}
+
+#[derive(Args)]
+struct WriteArgs {
+    /// Who writes: agent:<name>, user:<name>, system:<name>
+    #[arg(long, env = "DQADB_ACTOR")]
+    actor: Option<String>,
+    /// Source document; copied into sources/ by content hash
+    #[arg(long)]
+    source: Option<PathBuf>,
+    /// Fail unless the newest event is this ULID (optimistic concurrency)
+    #[arg(long)]
+    expected_version: Option<String>,
+}
+
+impl WriteArgs {
+    fn opts(self, note: Option<String>) -> WriteOpts {
+        let actor = self.actor.unwrap_or_else(|| {
+            format!(
+                "user:{}",
+                std::env::var("USER").unwrap_or_else(|_| "unknown".into())
+            )
+        });
+        WriteOpts {
+            actor,
+            source: self.source,
+            note,
+            expected_version: self.expected_version,
+        }
+    }
+}
+
+fn read_input(args: &InputArgs) -> Result<(Vec<InputOp>, Option<String>)> {
+    let text = if args.file.as_os_str() == "-" {
+        let mut s = String::new();
+        std::io::stdin().read_to_string(&mut s)?;
+        s
+    } else {
+        std::fs::read_to_string(&args.file)?
+    };
+    let value: serde_json::Value = serde_json::from_str(&text)?;
+    let (ops, note) = match value {
+        serde_json::Value::Array(_) => (value, None),
+        serde_json::Value::Object(mut m) => {
+            let note = m
+                .remove("note")
+                .and_then(|n| n.as_str().map(str::to_string));
+            (
+                m.remove("ops")
+                    .ok_or_else(|| Error::other("input object needs an \"ops\" array"))?,
+                note,
+            )
+        }
+        _ => {
+            return Err(Error::other(
+                "input must be a JSON array of ops or {\"ops\": [...]}",
+            ));
+        }
+    };
+    let ops = serde_json::from_value(ops).map_err(|e| Error::other(format!("bad op: {e}")))?;
+    Ok((ops, note))
+}
+
+fn print_json<T: serde::Serialize>(v: &T) -> Result<()> {
+    println!("{}", serde_json::to_string_pretty(v)?);
+    Ok(())
+}
+
+fn print_write(json: bool, r: &WriteResult) -> Result<()> {
+    if json {
+        return print_json(r);
+    }
+    println!(
+        "event {}  ops={} added={} retracted={}",
+        r.event_id, r.ops, r.added, r.retracted
+    );
+    for (tmp, iri) in &r.id_map {
+        println!("  {tmp} -> {}", iri.replacen("urn:dqadb:", "dqadb:", 1));
+    }
+    for w in &r.warnings {
+        println!("  warning: {w}");
+    }
+    Ok(())
+}
+
+fn print_card(c: &Card) {
+    let label = c
+        .label
+        .as_deref()
+        .map(|l| format!("  \"{l}\""))
+        .unwrap_or_default();
+    println!("{}{label}  [{}]", c.iri, c.types.join(", "));
+    let width = c.props.iter().map(|p| p.p.len()).max().unwrap_or(0);
+    for p in &c.props {
+        let label = p
+            .label
+            .as_deref()
+            .map(|l| format!(" \"{l}\""))
+            .unwrap_or_default();
+        let arrow = if p.is_iri { "→ " } else { "" };
+        println!("  {:width$}  {arrow}{}{label}", p.p, p.value);
+    }
+    if c.incoming_total > 0 {
+        println!("  incoming ({}):", c.incoming_total);
+        for p in &c.incoming {
+            let label = p
+                .label
+                .as_deref()
+                .map(|l| format!(" \"{l}\""))
+                .unwrap_or_default();
+            println!("    {}{label} {} → this", p.value, p.p);
+        }
+    }
+    if let Some(e) = &c.last_event {
+        let src = e
+            .source
+            .as_deref()
+            .map(|s| format!(" · {s}"))
+            .unwrap_or_default();
+        println!(
+            "  last change: {} · {} · {}{src}",
+            e.event_id,
+            e.actor,
+            &e.ts[..10]
+        );
+    }
+    println!(
+        "Next: dqadb get <iri> | dqadb events show {}",
+        c.last_event
+            .as_ref()
+            .map(|e| e.event_id.as_str())
+            .unwrap_or("<id>")
+    );
+}
+
+fn print_events(json: bool, list: &[EventSummary]) -> Result<()> {
+    if json {
+        return print_json(&list);
+    }
+    for e in list {
+        let src = e
+            .source
+            .as_deref()
+            .map(|s| format!("  src={s}"))
+            .unwrap_or_default();
+        let note = e
+            .note
+            .as_deref()
+            .map(|s| format!("  \"{s}\""))
+            .unwrap_or_default();
+        println!(
+            "{}  {}  {}  ops={}{src}{note}",
+            e.event_id, e.ts, e.actor, e.ops
+        );
+    }
+    if list.is_empty() {
+        println!("no events");
+    }
+    Ok(())
+}
+
+fn run(cli: Cli) -> Result<()> {
+    let json = cli.json;
+    if let Cmd::Init { path, base_iri } = &cli.cmd {
+        let kb = Kb::init(path, base_iri)?;
+        if json {
+            return print_json(&serde_json::json!({ "root": kb.root }));
+        }
+        println!("initialised {}", kb.root.display());
+        println!("Next: edit ontology/schema.linkml.yaml, then: dqadb ontology build");
+        return Ok(());
+    }
+    let start = cli.kb.clone().unwrap_or_else(|| PathBuf::from("."));
+    let kb = Kb::open(&start)?;
+
+    match cli.cmd {
+        Cmd::Init { .. } => unreachable!(),
+        Cmd::Status => {
+            let s = kb.status()?;
+            if json {
+                return print_json(&s);
+            }
+            println!("kb         {}", s.root.display());
+            println!("ontology   {}", s.ontology);
+            println!(
+                "events     {} indexed (latest on disk: {})",
+                s.counts.events,
+                s.latest_event.as_deref().unwrap_or("none")
+            );
+            println!("triples    {}", s.counts.triples);
+            println!("terms      {}", s.counts.terms);
+            println!(
+                "index      {}",
+                if s.in_sync {
+                    "in sync"
+                } else {
+                    "behind: next command catches up, or run: dqadb rebuild"
+                }
+            );
+        }
+        Cmd::Rebuild => {
+            let r = kb.rebuild()?;
+            if json {
+                return print_json(&r);
+            }
+            println!(
+                "rebuilt from {} events in {:.2}s: {} triples, {} terms",
+                r.events, r.seconds, r.counts.triples, r.counts.terms
+            );
+            println!("fingerprint {}", r.fingerprint);
+        }
+        Cmd::Verify => {
+            let r = kb.verify()?;
+            if json {
+                print_json(&r)?;
+            } else {
+                println!("{} event files, {} indexed", r.events, r.indexed_events);
+                for p in &r.problems {
+                    println!("  problem: {p}");
+                }
+                if r.problems.is_empty() {
+                    println!("ok");
+                }
+            }
+            if !r.problems.is_empty() {
+                return Err(Error::other(format!(
+                    "{} problem(s) found",
+                    r.problems.len()
+                )));
+            }
+        }
+        Cmd::NewId { n } => {
+            let ids = kb.new_ids(n);
+            if json {
+                return print_json(&ids);
+            }
+            ids.iter().for_each(|i| println!("{i}"));
+        }
+        Cmd::Ontology(OntologyCmd::Build { lock_only }) => {
+            let lock = kb.build_ontology(lock_only)?;
+            if json {
+                return print_json(&lock);
+            }
+            println!(
+                "ontology built: {} ({} file(s), generator: {})",
+                lock.hash,
+                lock.sources.len(),
+                lock.generator
+            );
+        }
+        Cmd::Ontology(OntologyCmd::Show { class }) => {
+            let onto = kb.ontology()?;
+            let selected: Vec<_> = match &class {
+                Some(c) => {
+                    let iri = onto.prefixes.expand(c).map_err(Error::Other)?;
+                    if !onto.classes.contains_key(&iri) {
+                        return Err(Error::NotFound(format!("class {c}")));
+                    }
+                    onto.lineage(&iri)
+                }
+                None => onto.classes.values().collect(),
+            };
+            if json {
+                let slots: Vec<_> = onto.slots.values().collect();
+                return print_json(
+                    &serde_json::json!({ "classes": selected, "slots": slots, "enums": onto.enums }),
+                );
+            }
+            for c in selected {
+                let parent = c
+                    .is_a
+                    .as_deref()
+                    .map(|p| format!(" is_a {}", onto.compact(p)))
+                    .unwrap_or_default();
+                println!("{}{parent}", onto.compact(&c.iri));
+                for s in &c.slots {
+                    let d = &onto.slots[s];
+                    let range = match &d.range {
+                        Range::Datatype(dt) | Range::Class(dt) => onto.compact(dt),
+                        Range::Enum(e) => format!(
+                            "enum {e} ({})",
+                            onto.enums[e].iter().cloned().collect::<Vec<_>>().join("|")
+                        ),
+                        Range::AnyIri => "IRI".into(),
+                    };
+                    let flags = [
+                        d.required.then_some("required"),
+                        d.multivalued.then_some("multivalued"),
+                    ]
+                    .into_iter()
+                    .flatten()
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                    let index = if d.index.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" index={}", d.index.join(","))
+                    };
+                    println!("  {} : {range} {flags}{index}", onto.compact(s));
+                }
+            }
+            println!("Also: rdf:type (class IRI), rdfs:label, rdfs:comment");
+        }
+        Cmd::Assert { input, write } => {
+            let (ops, note) = read_input(&input)?;
+            let r = kb.assert(&ops, &write.opts(note))?;
+            print_write(json, &r)?;
+        }
+        Cmd::Validate { input } => {
+            let (ops, _) = read_input(&input)?;
+            let n = kb.validate(&ops)?;
+            if json {
+                return print_json(&n);
+            }
+            println!("ok: {} op(s) valid", n.ops.len());
+            n.warnings.iter().for_each(|w| println!("  warning: {w}"));
+        }
+        Cmd::Retract { event, why, write } => {
+            let r = kb.retract_event(&event, &why, &write.opts(None))?;
+            print_write(json, &r)?;
+        }
+        Cmd::Get { iri } => {
+            let card = kb.get(&iri)?;
+            if json {
+                return print_json(&card);
+            }
+            print_card(&card);
+        }
+        Cmd::Query { .. } => {
+            return Err(Error::other(
+                "SPARQL is not implemented yet (milestone M1). Use: dqadb get <iri>",
+            ));
+        }
+        Cmd::Events(EventsCmd::Show { id }) => print_json(&kb.event(&id)?)?,
+        Cmd::Events(EventsCmd::Ls {
+            limit,
+            actor,
+            since,
+        }) => {
+            let list = kb.events_ls(limit, actor.as_deref(), since.as_deref())?;
+            print_events(json, &list)?;
+        }
+    }
+    Ok(())
+}
+
+fn main() -> ExitCode {
+    let cli = Cli::parse();
+    let json = cli.json;
+    match run(cli) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            if json {
+                let detail = match &e {
+                    Error::Validation(r) => serde_json::to_value(r).unwrap_or_default(),
+                    _ => serde_json::Value::Null,
+                };
+                eprintln!(
+                    "{}",
+                    serde_json::json!({ "error": e.to_string(), "code": e.exit_code(), "detail": detail })
+                );
+            } else {
+                eprint!("error: {e}");
+                if !e.to_string().ends_with('\n') {
+                    eprintln!();
+                }
+            }
+            ExitCode::from(e.exit_code() as u8)
+        }
+    }
+}
