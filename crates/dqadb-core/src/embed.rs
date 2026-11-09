@@ -369,6 +369,23 @@ pub fn from_f16_bytes(b: &[u8]) -> Vec<f32> {
         .collect()
 }
 
+/// Cosine of `query` with an f16-encoded vector, decoding into a reused buffer
+/// (bulk f16->f32 conversion uses the CPU's F16C instructions when available).
+pub fn dot_f16(query: &[f32], blob: &[u8], bits: &mut Vec<u16>, buf: &mut Vec<f32>) -> f32 {
+    use half::slice::{HalfBitsSliceExt, HalfFloatSliceExt};
+    bits.clear();
+    bits.extend(
+        blob.as_chunks::<2>()
+            .0
+            .iter()
+            .map(|c| u16::from_le_bytes(*c)),
+    );
+    buf.resize(bits.len(), 0.0);
+    bits.reinterpret_cast::<half::f16>()
+        .convert_to_f32_slice(buf);
+    dot(query, buf)
+}
+
 pub fn dot(a: &[f32], b: &[f32]) -> f32 {
     a.iter().zip(b).map(|(x, y)| x * y).sum()
 }

@@ -303,8 +303,9 @@ pub fn rank(
         }
     }
     let mut scored: Vec<(Id, f32)> = Vec::new();
+    let (mut bits, mut buf) = (Vec::new(), Vec::new());
     let mut visit =
-        |id: Id, blob: &[u8]| scored.push((id, embed::dot(query, &embed::from_f16_bytes(blob))));
+        |id: Id, blob: &[u8]| scored.push((id, embed::dot_f16(query, blob, &mut bits, &mut buf)));
     match candidates {
         Some(ids) => r.vec_of(ids, &mut visit)?,
         None => r.vec_each(&mut visit)?,

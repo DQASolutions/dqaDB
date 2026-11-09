@@ -12,6 +12,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use usearch::{Index, IndexOptions, MetricKind, ScalarKind};
 
@@ -47,6 +48,38 @@ pub struct CompactReport {
     pub seconds: f64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub skipped: Option<String>,
+}
+
+/// HNSW search breadth (usearch default is 64). Override with DQADB_HNSW_EF.
+pub const EXPANSION_SEARCH: usize = 128;
+
+type OpenBase = (PathBuf, BaseMeta, Option<std::time::SystemTime>, Arc<Index>);
+
+/// The memory-mapped base, opened once per process and reused until the file changes
+/// (a long-running `dqadb serve` then searches in ~1 ms instead of re-mapping each time).
+fn open_cached(file: &Path, meta: &BaseMeta) -> Result<Arc<Index>> {
+    static OPEN: Mutex<Option<OpenBase>> = Mutex::new(None);
+    let mtime = std::fs::metadata(file).and_then(|m| m.modified()).ok();
+    let mut slot = OPEN.lock().unwrap_or_else(|p| p.into_inner());
+    if let Some((p, m, t, idx)) = slot.as_ref()
+        && p == file
+        && m == meta
+        && *t == mtime
+    {
+        return Ok(idx.clone());
+    }
+    let index = Index::new(&options(meta.dim)).map_err(ann_err)?;
+    index
+        .view(file.to_str().ok_or_else(|| ann_err("non-UTF-8 path"))?)
+        .map_err(ann_err)?;
+    let ef = std::env::var("DQADB_HNSW_EF")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(EXPANSION_SEARCH);
+    index.change_expansion_search(ef);
+    let index = Arc::new(index);
+    *slot = Some((file.to_path_buf(), meta.clone(), mtime, index.clone()));
+    Ok(index)
 }
 
 pub fn dir(index_dir: &Path) -> PathBuf {
@@ -200,10 +233,7 @@ pub fn search(
 ) -> Result<(Vec<(Id, f32)>, usize)> {
     let stale: HashSet<u64> = r.vec_changed_since(meta.seq)?.into_iter().collect();
     let (file, _) = files(dir);
-    let index = Index::new(&options(meta.dim)).map_err(ann_err)?;
-    index
-        .view(file.to_str().ok_or_else(|| ann_err("non-UTF-8 path"))?)
-        .map_err(ann_err)?;
+    let index = open_cached(&file, meta)?;
     let found = match (stale.is_empty(), allow) {
         (true, None) => index.search(query, n).map_err(ann_err)?,
         (_, None) => index

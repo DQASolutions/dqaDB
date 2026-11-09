@@ -491,7 +491,7 @@ impl Reader<'_> {
     pub fn vec_since(&self, seq: u64, mut f: impl FnMut(Id, &[u8])) -> Result<()> {
         let mut st = self
             .conn
-            .prepare_cached("SELECT id, vec FROM vecs WHERE seq > ?1 ORDER BY id")?;
+            .prepare_cached("SELECT id, vec FROM vecs INDEXED BY vecs_seq WHERE seq > ?1")?;
         let mut rows = st.query([seq as i64])?;
         while let Some(row) = rows.next()? {
             f(
