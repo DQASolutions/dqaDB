@@ -30,8 +30,8 @@ use crate::{Error, Result};
 
 /// Bump when the layout changes; a mismatch forces `dqadb rebuild`.
 /// 3: SQLite backend (1-2 were LMDB). 4: `props` table for typed literal filters.
-/// 5: `vecs` / `vec_dead` tables for the vector projection.
-pub const STORE_FORMAT: u32 = 5;
+/// 5: `vecs` / `vec_dead` tables for the vector projection. 6: 16 KB pages.
+pub const STORE_FORMAT: u32 = 6;
 const PAGE: i64 = 1024;
 const BUSY_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -226,7 +226,9 @@ fn connect(path: &Path, bulk: bool) -> Result<Connection> {
     // the events are already durable and the next command catches up from them.
     let sync = if bulk { "OFF" } else { "NORMAL" };
     conn.execute_batch(&format!(
-        "PRAGMA journal_mode=WAL; PRAGMA synchronous={sync}; PRAGMA foreign_keys=OFF;
+        // 16 KB pages: a 1024-dim f16 vector (~2 KB) fills 4 KB pages only half
+        // (one row per page); 16 KB pages hold 7. Applies when the file is created.
+        "PRAGMA page_size=16384; PRAGMA journal_mode=WAL; PRAGMA synchronous={sync}; PRAGMA foreign_keys=OFF;
          PRAGMA cache_size=-65536; PRAGMA mmap_size=268435456;"
     ))?;
     Ok(conn)

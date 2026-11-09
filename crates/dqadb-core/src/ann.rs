@@ -39,6 +39,34 @@ pub struct BaseMeta {
     pub config: String,
     pub count: usize,
     pub dim: usize,
+    /// vector encoding inside the HNSW file: "f16" or "i8"
+    #[serde(default = "f16_name")]
+    pub quant: String,
+}
+
+fn f16_name() -> String {
+    "f16".into()
+}
+
+/// Encoding for new bases: `i8` stores vectors at 1 byte/dim and re-ranks the
+/// candidates exactly with the f16 vectors kept in the index; `f16` is exact enough
+/// on its own. Override with DQADB_HNSW_QUANT.
+pub const BASE_QUANT: &str = "i8";
+
+pub fn base_quant() -> String {
+    match std::env::var("DQADB_HNSW_QUANT").as_deref() {
+        Ok("i8") => "i8".into(),
+        Ok("f16") => "f16".into(),
+        _ => BASE_QUANT.into(),
+    }
+}
+
+fn scalar(quant: &str) -> ScalarKind {
+    if quant == "i8" {
+        ScalarKind::I8
+    } else {
+        ScalarKind::F16
+    }
 }
 
 #[derive(Debug, Default, Serialize)]
@@ -68,7 +96,7 @@ fn open_cached(file: &Path, meta: &BaseMeta) -> Result<Arc<Index>> {
     {
         return Ok(idx.clone());
     }
-    let index = Index::new(&options(meta.dim)).map_err(ann_err)?;
+    let index = Index::new(&options(meta.dim, &meta.quant)).map_err(ann_err)?;
     index
         .view(file.to_str().ok_or_else(|| ann_err("non-UTF-8 path"))?)
         .map_err(ann_err)?;
@@ -94,11 +122,11 @@ fn ann_err(e: impl std::fmt::Display) -> Error {
     Error::other(format!("vector index: {e}"))
 }
 
-fn options(dim: usize) -> IndexOptions {
+fn options(dim: usize, quant: &str) -> IndexOptions {
     IndexOptions {
         dimensions: dim,
         metric: MetricKind::Cos,
-        quantization: ScalarKind::F16,
+        quantization: scalar(quant),
         ..Default::default()
     }
 }
@@ -115,6 +143,7 @@ pub fn usable(dir: &Path, r: &Reader, state: Option<&VecState>) -> Result<Option
     };
     let fresh = Some(&meta.epoch) == r.vec_epoch()?.as_ref()
         && meta.config == state.config
+        && meta.quant == base_quant()
         && meta.seq <= r.vec_seq()?;
     Ok(fresh.then_some(meta))
 }
@@ -158,7 +187,8 @@ pub fn build(store_path: &Path, dir: &Path, dim: usize) -> Result<CompactReport>
     };
     let seq = r.vec_seq()?;
     let count = r.vec_count()? as usize;
-    let index = Index::new(&options(dim)).map_err(ann_err)?;
+    let quant = base_quant();
+    let index = Index::new(&options(dim, &quant)).map_err(ann_err)?;
     index.reserve(count.max(1)).map_err(ann_err)?;
     let threads = std::thread::available_parallelism()
         .map(|n| n.get())
@@ -208,6 +238,7 @@ pub fn build(store_path: &Path, dir: &Path, dim: usize) -> Result<CompactReport>
         config: state.config,
         count: added,
         dim,
+        quant,
     };
     let tmp_meta = dir.join("base.json.tmp");
     std::fs::write(&tmp_meta, serde_json::to_vec_pretty(&meta)?)?;
@@ -234,21 +265,36 @@ pub fn search(
     let stale: HashSet<u64> = r.vec_changed_since(meta.seq)?.into_iter().collect();
     let (file, _) = files(dir);
     let index = open_cached(&file, meta)?;
+    // an i8 base only proposes candidates; their f16 vectors give the exact order
+    let pool = if meta.quant == "i8" {
+        (n * 8).max(64)
+    } else {
+        n
+    };
     let found = match (stale.is_empty(), allow) {
-        (true, None) => index.search(query, n).map_err(ann_err)?,
+        (true, None) => index.search(query, pool).map_err(ann_err)?,
         (_, None) => index
-            .filtered_search(query, n, |k| !stale.contains(&k))
+            .filtered_search(query, pool, |k| !stale.contains(&k))
             .map_err(ann_err)?,
         (_, Some(a)) => index
-            .filtered_search(query, n, |k| a.contains(&k) && !stale.contains(&k))
+            .filtered_search(query, pool, |k| a.contains(&k) && !stale.contains(&k))
             .map_err(ann_err)?,
     };
-    let mut hits: Vec<(Id, f32)> = found
-        .keys
-        .iter()
-        .zip(&found.distances)
-        .map(|(k, d)| (*k, 1.0 - *d))
-        .collect();
+    let mut hits: Vec<(Id, f32)> = if meta.quant == "i8" {
+        let mut exact = Vec::with_capacity(found.keys.len());
+        let (mut bits, mut buf) = (Vec::new(), Vec::new());
+        r.vec_of(&found.keys, |id, blob| {
+            exact.push((id, embed::dot_f16(query, blob, &mut bits, &mut buf)))
+        })?;
+        exact
+    } else {
+        found
+            .keys
+            .iter()
+            .zip(&found.distances)
+            .map(|(k, d)| (*k, 1.0 - *d))
+            .collect()
+    };
     r.vec_since(meta.seq, |id, blob| {
         if allow.is_none_or(|a| a.contains(&id)) {
             hits.push((id, embed::dot(query, &embed::from_f16_bytes(blob))));

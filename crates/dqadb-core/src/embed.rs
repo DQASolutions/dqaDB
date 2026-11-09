@@ -238,15 +238,53 @@ pub fn text_key(model_id: &str, text: &str) -> [u8; 32] {
 }
 
 impl Cache {
+    /// Cache file `<model>.f16.sqlite`. Vectors are stored as f16 (the index stores f16
+    /// too, so rebuilding from the cache gives the same index). A cache from an older
+    /// version (`<model>.sqlite`, f32) is converted on first open.
     pub fn open(dir: &Path, model_id: &str) -> Result<Self> {
         std::fs::create_dir_all(dir)?;
-        let conn = Connection::open(dir.join(format!("{model_id}.sqlite")))?;
+        let path = dir.join(format!("{model_id}.f16.sqlite"));
+        let fresh = !path.exists();
+        let conn = Connection::open(&path)?;
         conn.busy_timeout(Duration::from_secs(30))?;
         conn.execute_batch(
-            "PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;
-             CREATE TABLE IF NOT EXISTS emb(key BLOB PRIMARY KEY, vec BLOB NOT NULL) WITHOUT ROWID;",
+            "PRAGMA page_size=16384; PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;
+             CREATE TABLE IF NOT EXISTS emb(id INTEGER PRIMARY KEY, key BLOB NOT NULL UNIQUE, vec BLOB NOT NULL);",
         )?;
-        Ok(Self { conn })
+        let mut cache = Self { conn };
+        let old = dir.join(format!("{model_id}.sqlite"));
+        if fresh && old.exists() {
+            cache.import_f32(&old)?;
+            for suffix in ["", "-wal", "-shm"] {
+                let _ = std::fs::remove_file(format!("{}{suffix}", old.display()));
+            }
+        }
+        Ok(cache)
+    }
+
+    fn import_f32(&mut self, old: &Path) -> Result<()> {
+        let src = Connection::open(old)?;
+        let mut st = src.prepare("SELECT key, vec FROM emb")?;
+        let rows = st.query_map([], |r| {
+            Ok((r.get::<_, Vec<u8>>(0)?, r.get::<_, Vec<u8>>(1)?))
+        })?;
+        let tx = self.conn.transaction()?;
+        {
+            let mut ins =
+                tx.prepare_cached("INSERT OR REPLACE INTO emb(key, vec) VALUES (?1, ?2)")?;
+            for row in rows {
+                let (k, v) = row?;
+                let f: Vec<f32> = v
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|c| f32::from_le_bytes(*c))
+                    .collect();
+                ins.execute(params![k, to_f16_bytes(&f)])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
     }
 
     pub fn get(&self, key: &[u8; 32]) -> Result<Option<Vec<f32>>> {
@@ -255,22 +293,16 @@ impl Cache {
             .prepare_cached("SELECT vec FROM emb WHERE key = ?1")?
             .query_row([&key[..]], |r| r.get(0))
             .optional()?;
-        Ok(blob.map(|b| {
-            b.as_chunks::<4>()
-                .0
-                .iter()
-                .map(|c| f32::from_le_bytes(*c))
-                .collect()
-        }))
+        Ok(blob.map(|b| from_f16_bytes(&b)))
     }
 
     pub fn put_many(&mut self, items: &[([u8; 32], Vec<f32>)]) -> Result<()> {
         let tx = self.conn.transaction()?;
         {
-            let mut st = tx.prepare_cached("INSERT OR REPLACE INTO emb VALUES (?1, ?2)")?;
+            let mut st =
+                tx.prepare_cached("INSERT OR REPLACE INTO emb(key, vec) VALUES (?1, ?2)")?;
             for (k, v) in items {
-                let bytes: Vec<u8> = v.iter().flat_map(|x| x.to_le_bytes()).collect();
-                st.execute(params![&k[..], bytes])?;
+                st.execute(params![&k[..], to_f16_bytes(v)])?;
             }
         }
         tx.commit()?;
