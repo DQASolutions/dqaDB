@@ -45,14 +45,23 @@ Exit codes: 0 ok · 1 error · 2 validation · 3 not found · 4 ontology not bui
 
 ## Status (milestone M1)
 
-Done: `init`, `status`, `rebuild`, `verify`, `new-id`, `ontology build|show`, `assert`, `validate`, `retract --event`, `get`, `query` (SPARQL 1.1), `search` (type + `--where` filters), `traverse`, `path`, `events show|ls`; RDFS subclass inference.
+Done: `init`, `status`, `rebuild`, `verify`, `new-id`, `ontology build|show`, `assert`, `validate`, `retract --event`, `get`, `query` (SPARQL 1.1), `search` (`--text` full-text, `--type`, `--where` filters), `traverse`, `path`, `events show|ls`; RDFS subclass inference.
 Validation enforces the LinkML schema directly (known predicates/classes, ranges, enums, required, single-valued).
 
-Not yet: full-text and vector search (M2), web UI (M3). SHACL: validation runs from LinkML directly; `shapes.ttl` is an export (no runtime SHACL engine until hand-written shapes need one).
+Not yet: vector search and bge-m3 embeddings (M2), web UI (M3). SHACL: validation runs from LinkML directly; `shapes.ttl` is an export (no runtime SHACL engine until hand-written shapes need one).
 
 ## Index store
 
 The derived index is a single SQLite file, `.dqadb/index.sqlite` (WAL mode). SQLite was chosen over LMDB after a benchmark on this workload (5M triples): LMDB reads were 2-3x faster, but SQLite files were 2.7x smaller, small commits ~15x faster, its file format is guaranteed stable to 2050, many processes can read while one writes, and the index can be inspected with `sqlite3 .dqadb/index.sqlite`. redb, fjall, sled, RocksDB and DuckDB were ruled out because they do not allow a second process to read while another holds the database.
+
+## Full-text search
+
+```bash
+dqadb search --text "hai phong"                       # accents and đ/d ignored
+dqadb search --text "vận tải" --type ex:Company --where 'ex:country = "VN"'
+```
+
+Full-text runs on tantivy (pinned `=0.27.0`) in `.dqadb/fts/`, as a derived projection with its own watermark stored in the tantivy commit payload. `assert` never touches it; the next text search catches up on the entities touched since that watermark, in one commit. A crash at any point leaves an older watermark, so the next search repairs it; a change to which predicates have `dqadb_index: fts` triggers a re-index. Benchmark at 1M documents: p50 0.5-0.8 ms, p95 under 2 ms, ~100 MB (SQLite FTS5: 9-45 ms, p95 up to ~150 ms).
 
 ## SPARQL
 

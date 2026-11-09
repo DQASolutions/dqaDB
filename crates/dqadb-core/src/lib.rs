@@ -4,6 +4,7 @@
 pub mod config;
 pub mod error;
 pub mod event;
+pub mod fts;
 pub mod kb;
 pub mod lock;
 pub mod ontology;

@@ -365,6 +365,7 @@ fn search_traverse_and_path() {
                 wheres: wheres.iter().map(|s| s.to_string()).collect(),
                 limit: 10,
                 cursor: None,
+                text: None,
             })
             .unwrap();
         let mut labels: Vec<String> = page.hits.into_iter().filter_map(|h| h.label).collect();
@@ -448,4 +449,81 @@ fn search_traverse_and_path() {
     let fp = kb.fingerprint().unwrap();
     assert_eq!(kb.rebuild().unwrap().fingerprint, fp);
     assert_eq!(q(&[], &["ex:value >= 1000"]), vec!["HĐ 123"]);
+}
+
+#[test]
+fn full_text_is_accent_insensitive_lazy_and_self_repairing() {
+    use dqadb_core::search::SearchQuery;
+    let (dir, kb) = new_kb();
+    let res = kb.assert(&acme(), &opts()).unwrap();
+    let acme_iri = res.id_map["_:acme"].replace("urn:dqadb:", "dqadb:");
+    kb.assert(
+        &ops(serde_json::json!([
+            {"op": "add", "s": acme_iri, "p": "ex:description", "o": "Công ty vận tải biển tại Hải Phòng"},
+            {"op": "add", "s": "_:b", "p": "rdf:type", "o": "ex:Company"},
+            {"op": "add", "s": "_:b", "p": "rdfs:label", "o": "Beta Đường Sắt"},
+            {"op": "add", "s": "_:b", "p": "ex:description", "o": "Vận chuyển hàng hóa bằng ĐƯỜNG SẮT Bắc Nam"},
+            {"op": "add", "s": "_:b", "p": "ex:country", "o": "VN"}
+        ])),
+        &opts(),
+    )
+    .unwrap();
+    let text = |kb: &Kb, t: &str, types: &[&str]| -> Vec<String> {
+        kb.search(&SearchQuery {
+            text: Some(t.into()),
+            types: types.iter().map(|s| s.to_string()).collect(),
+            limit: 10,
+            ..Default::default()
+        })
+        .unwrap()
+        .hits
+        .into_iter()
+        .filter_map(|h| h.label)
+        .collect()
+    };
+
+    // accents and đ/d are ignored, case too; terms are ANDed
+    assert_eq!(text(&kb, "hai phong", &[]), vec!["ACME Logistics"]);
+    assert_eq!(text(&kb, "Hải Phòng", &[]), vec!["ACME Logistics"]);
+    assert_eq!(text(&kb, "duong sat", &[]), vec!["Beta Đường Sắt"]);
+    assert!(text(&kb, "hai phong duong", &[]).is_empty());
+    // combined with a structured filter (filter first, then BM25)
+    assert_eq!(text(&kb, "hd", &["ex:Contract"]), vec!["HĐ 123"]);
+    assert!(text(&kb, "hd", &["ex:Company"]).is_empty());
+
+    // lazy: a write does not touch the text index; the next text search catches up
+    kb.assert(&ops(serde_json::json!([
+        {"op": "add", "s": acme_iri, "p": "rdfs:comment", "o": "Đối tác chiến lược cảng Cát Lái"}
+    ])), &opts()).unwrap();
+    assert_eq!(text(&kb, "cat lai", &[]), vec!["ACME Logistics"]);
+    // retracting the text removes the match
+    kb.assert(&ops(serde_json::json!([
+        {"op": "retract", "s": acme_iri, "p": "rdfs:comment", "o": "Đối tác chiến lược cảng Cát Lái"}
+    ])), &opts()).unwrap();
+    assert!(text(&kb, "cat lai", &[]).is_empty());
+
+    // losing the text index entirely is repaired by the next search
+    std::fs::remove_dir_all(dir.path().join(".dqadb/fts")).unwrap();
+    assert_eq!(text(&kb, "hai phong", &[]), vec!["ACME Logistics"]);
+
+    // indexing config follows the ontology: make ex:country full-text searchable
+    let schema = dir.path().join("ontology/schema.linkml.yaml");
+    let yaml = std::fs::read_to_string(&schema).unwrap();
+    std::fs::write(
+        &schema,
+        yaml.replace(
+            "      dqadb_index: filter\n  has_contract:",
+            "      dqadb_index: filter,fts\n  has_contract:",
+        ),
+    )
+    .unwrap();
+    kb.build_ontology(true).unwrap();
+    let mut vn = text(&kb, "vn", &[]);
+    vn.sort();
+    assert_eq!(vn, vec!["ACME Logistics", "Beta Đường Sắt"]);
+
+    // rebuild re-creates both indexes
+    let report = kb.rebuild().unwrap();
+    assert_eq!(report.text_documents, 3);
+    assert_eq!(text(&kb, "duong sat", &[]), vec!["Beta Đường Sắt"]);
 }

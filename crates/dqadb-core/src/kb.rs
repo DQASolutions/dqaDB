@@ -4,6 +4,7 @@
 use rayon::prelude::*;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -11,6 +12,7 @@ use ulid::Ulid;
 
 use crate::config::{CONFIG_FILE, Config};
 use crate::event::{self, EVENT_SCHEMA, Event, Op, OpKind, Source};
+use crate::fts::{self, Fts, FtsState};
 use crate::lock::WriteLock;
 use crate::ontology::{self, Inference, InputOp, Ontology};
 use crate::rdf::{self, Term};
@@ -65,6 +67,8 @@ pub struct RebuildReport {
     pub events: usize,
     pub counts: Counts,
     pub fingerprint: String,
+    /// entities in the full-text index
+    pub text_documents: usize,
     pub seconds: f64,
 }
 
@@ -332,12 +336,74 @@ impl Kb {
         std::fs::remove_dir_all(&tmp_root)?;
         let store = self.store()?;
         self.write_manifest(&store, Some(fingerprint.clone()))?;
+        // the text index follows the new index: start it from scratch
+        let fts_dir = fts::dir(&self.index_dir());
+        if fts_dir.exists() {
+            std::fs::remove_dir_all(&fts_dir)?;
+        }
+        let (_, text_documents) = self.fts_locked(&store, &self.ontology()?)?;
         Ok(RebuildReport {
             events: files.len(),
             counts,
             fingerprint,
+            text_documents,
             seconds: started.elapsed().as_secs_f64(),
         })
+    }
+
+    /// The full-text projection, caught up with the SQLite index (spec §11).
+    /// Fast path: its commit payload already matches, no lock taken.
+    pub(crate) fn fts_ready(&self, store: &Store, onto: &Ontology) -> Result<Fts> {
+        let fts = Fts::open_or_create(&fts::dir(&self.index_dir()))?;
+        let want = FtsState {
+            watermark: store.read()?.watermark()?.map(|u| u.to_string()),
+            config: fts::config_hash(&fts_predicates(onto)),
+        };
+        if fts.state()?.as_ref() == Some(&want) {
+            return Ok(fts);
+        }
+        drop(fts);
+        let _lock = self.lock()?;
+        Ok(self.fts_locked(store, onto)?.0)
+    }
+
+    /// Catch the text index up (caller holds the write lock). Returns the index and the
+    /// number of documents written.
+    fn fts_locked(&self, store: &Store, onto: &Ontology) -> Result<(Fts, usize)> {
+        let fts = Fts::open_or_create(&fts::dir(&self.index_dir()))?;
+        let preds = fts_predicates(onto);
+        let r = store.read()?;
+        let wm = r.watermark()?;
+        let want = FtsState {
+            watermark: wm.map(|u| u.to_string()),
+            config: fts::config_hash(&preds),
+        };
+        let have = fts.state()?;
+        if have.as_ref() == Some(&want) {
+            drop(r);
+            return Ok((fts, 0));
+        }
+        let mut pred_ids = Vec::new();
+        for p in &preds {
+            if let Some(id) = r.term_id(&Term::Iri(p.clone()))? {
+                pred_ids.push(id);
+            }
+        }
+        let have_wm = have
+            .as_ref()
+            .and_then(|h| h.watermark.as_deref())
+            .map(event::parse_ulid)
+            .transpose()?;
+        let incremental = have.as_ref().is_some_and(|h| h.config == want.config) && have_wm <= wm;
+        let n = if incremental {
+            let names: HashSet<String> = preds.into_iter().collect();
+            let touched = fts::touched_subjects(&r, &self.events_dir(), have_wm, wm, &names)?;
+            fts.update(&r, &touched, &pred_ids, &want)?
+        } else {
+            fts.rebuild(&r, &pred_ids, &want)?
+        };
+        drop(r);
+        Ok((fts, n))
     }
 
     fn write_manifest(&self, store: &Store, fingerprint: Option<String>) -> Result<()> {
@@ -769,4 +835,16 @@ fn replay(store: &Store, files: &[(Ulid, PathBuf)], inference: &Inference) -> Re
         batch.commit()?;
     }
     Ok(files.len())
+}
+
+/// Predicates whose literals go into the full-text index (`dqadb_index: fts`).
+fn fts_predicates(onto: &Ontology) -> Vec<String> {
+    let mut v: Vec<String> = onto
+        .slots
+        .values()
+        .filter(|s| s.index.iter().any(|i| i == "fts"))
+        .map(|s| s.iri.clone())
+        .collect();
+    v.sort();
+    v
 }

@@ -123,6 +123,9 @@ enum Cmd {
         /// Field filter; repeatable (AND)
         #[arg(long = "where")]
         wheres: Vec<String>,
+        /// Full-text query, ranked by BM25 (accents and đ/d ignored)
+        #[arg(long)]
+        text: Option<String>,
         #[arg(short = 'k', long, default_value_t = 10)]
         limit: usize,
         /// Continue from a previous page
@@ -645,12 +648,14 @@ fn run(cli: Cli) -> Result<()> {
         Cmd::Search {
             types,
             wheres,
+            text,
             limit,
             cursor,
         } => {
             let page = kb.search(&SearchQuery {
                 types,
                 wheres,
+                text,
                 limit,
                 cursor,
             })?;

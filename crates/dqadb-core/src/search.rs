@@ -3,6 +3,7 @@
 
 use serde::Serialize;
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::Arc;
 
 use crate::error::ValidationReport;
 use crate::kb::{Kb, TypeRef};
@@ -18,6 +19,8 @@ pub struct SearchQuery {
     pub types: Vec<String>,
     /// filters such as `ex:country = "VN"`, `ex:value >= 10000`, `has ex:email`
     pub wheres: Vec<String>,
+    /// full-text query (accents and đ/d ignored); results ranked by BM25
+    pub text: Option<String>,
     pub limit: usize,
     /// opaque continuation from a previous page
     pub cursor: Option<String>,
@@ -32,6 +35,9 @@ pub struct Hit {
     /// values of the filtered predicates, to show why it matched
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub matched: Vec<(String, String)>,
+    /// BM25 score when the search had --text
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub score: Option<f32>,
 }
 
 #[derive(Debug, Serialize)]
@@ -274,12 +280,17 @@ pub(crate) fn label_of(r: &Reader, id: Id) -> Result<Option<String>> {
 impl Kb {
     /// Entities matching all type and `--where` conditions, in stable (id) order.
     pub fn search(&self, q: &SearchQuery) -> Result<SearchPage> {
-        if q.types.is_empty() && q.wheres.is_empty() {
-            return Err(Error::other("give at least one --type or --where"));
+        if q.types.is_empty() && q.wheres.is_empty() && q.text.is_none() {
+            return Err(Error::other("give at least one of --text, --type, --where"));
         }
         self.sync()?;
         let onto = self.ontology()?;
         let store = self.store_handle()?;
+        // catch the text index up before taking the read snapshot (it needs the store)
+        let fts = match &q.text {
+            Some(_) => Some(self.fts_ready(&store, &onto)?),
+            None => None,
+        };
         let r = store.read()?;
 
         let mut clauses: Vec<(String, Clause)> = q
@@ -320,7 +331,6 @@ impl Kb {
                 break;
             }
         }
-        let all = result.unwrap_or_default();
         let offset: usize = match &q.cursor {
             Some(c) => c
                 .parse()
@@ -328,8 +338,31 @@ impl Kb {
             None => 0,
         };
         let limit = q.limit.max(1);
+        // (entity, score) in result order, and the total number of matches
+        let (page, total): (Vec<(Id, Option<f32>)>, usize) = match (&q.text, fts) {
+            (Some(text), Some(fts)) => {
+                let candidates =
+                    result.map(|ids| Arc::new(ids.into_iter().collect::<HashSet<u64>>()));
+                let (ranked, total) = fts.search(text, candidates, limit, offset)?;
+                (
+                    ranked.into_iter().map(|(id, sc)| (id, Some(sc))).collect(),
+                    total,
+                )
+            }
+            _ => {
+                let all = result.unwrap_or_default();
+                (
+                    all.iter()
+                        .skip(offset)
+                        .take(limit)
+                        .map(|id| (*id, None))
+                        .collect(),
+                    all.len(),
+                )
+            }
+        };
         let mut hits = Vec::new();
-        for id in all.iter().skip(offset).take(limit) {
+        for (id, score) in &page {
             let mut matched = Vec::new();
             for p in &shown {
                 for o in r.objects(*id, *p)? {
@@ -344,12 +377,13 @@ impl Kb {
                 label: label_of(&r, *id)?,
                 types: types_of(&r, &onto, *id)?,
                 matched,
+                score: *score,
             });
         }
         let next = offset + hits.len();
         Ok(SearchPage {
-            total: all.len(),
-            next_cursor: (next < all.len()).then(|| next.to_string()),
+            total,
+            next_cursor: (next < total).then(|| next.to_string()),
             hits,
         })
     }
@@ -393,6 +427,7 @@ impl Kb {
                     _ => Vec::new(),
                 },
                 matched: Vec::new(),
+                score: None,
             });
         }
         Ok(out)
