@@ -267,6 +267,11 @@ impl Kb {
         self.embedder.get()?.embed(texts)
     }
 
+    /// Replace the configured embedding model with your own (before first use).
+    pub fn set_embedder(&self, embedder: Box<dyn embed::Embedder>) -> Result<()> {
+        self.embedder.set(embedder)
+    }
+
     /// Model id of the configured embedder, and whether it is loaded in this process.
     pub fn embedder_status(&self) -> (String, bool) {
         (self.embedder.id(), self.embedder.loaded())

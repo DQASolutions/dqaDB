@@ -324,6 +324,7 @@ pub struct LazyEmbedder {
     cfg: EmbeddingConfig,
     inner: OnceLock<Box<dyn Embedder>>,
     init: Mutex<()>,
+    custom: OnceLock<()>,
 }
 
 impl LazyEmbedder {
@@ -332,11 +333,28 @@ impl LazyEmbedder {
             cfg: cfg.clone(),
             inner: OnceLock::new(),
             init: Mutex::new(()),
+            custom: OnceLock::new(),
         }
     }
 
+    /// Id used for cache keys and the vector config: the supplied embedder's own id when
+    /// one was set with [`LazyEmbedder::set`], else derived from the configuration.
     pub fn id(&self) -> String {
-        model_id(&self.cfg)
+        match self.inner.get() {
+            Some(e) if self.custom.get().is_some() => e.id().to_string(),
+            _ => model_id(&self.cfg),
+        }
+    }
+
+    /// Use this embedder instead of the configured model (library use: your own model,
+    /// or precomputed vectors). Must be called before the model is first used.
+    pub fn set(&self, embedder: Box<dyn Embedder>) -> Result<()> {
+        let _guard = self.init.lock().unwrap_or_else(|p| p.into_inner());
+        self.inner
+            .set(embedder)
+            .map_err(|_| Error::other("embedder already loaded"))?;
+        let _ = self.custom.set(());
+        Ok(())
     }
 
     pub fn loaded(&self) -> bool {

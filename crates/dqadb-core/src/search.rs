@@ -263,6 +263,53 @@ fn resolve(
     })
 }
 
+/// A page of (entity, score) in result order, and the total number of matches.
+type Ranked = (Vec<(Id, Option<f32>)>, usize);
+
+/// Largest number of nearest neighbours checked against the filters before falling back
+/// to building the candidate set.
+const POSTFILTER_MAX_POOL: usize = 1024;
+
+/// Whether entity `s` satisfies the conditions on predicate `p` (any condition holds).
+fn matches(r: &Reader, s: Id, p: Id, conds: &[PropCond]) -> Result<bool> {
+    let values = r.objects(s, p)?;
+    for c in conds {
+        let ok = match c {
+            PropCond::Has => !values.is_empty(),
+            PropCond::Iri(o) => values.contains(o),
+            PropCond::Num(op, v) => values.iter().any(|o| match r.term(*o) {
+                Ok(Term::Literal(l)) => literal_key(&l)
+                    .0
+                    .is_some_and(|x| cmp(*op, x.partial_cmp(v))),
+                _ => false,
+            }),
+            PropCond::Txt(op, v) => values.iter().any(|o| match r.term(*o) {
+                Ok(Term::Literal(l)) => literal_key(&l)
+                    .1
+                    .is_some_and(|x| cmp(*op, Some(x.as_str().cmp(v.as_str())))),
+                _ => false,
+            }),
+        };
+        if ok {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn cmp(op: CmpOp, ord: Option<std::cmp::Ordering>) -> bool {
+    use std::cmp::Ordering::*;
+    match (op, ord) {
+        (_, None) => false,
+        (CmpOp::Eq, Some(o)) => o == Equal,
+        (CmpOp::Ne, Some(o)) => o != Equal,
+        (CmpOp::Lt, Some(o)) => o == Less,
+        (CmpOp::Le, Some(o)) => o != Greater,
+        (CmpOp::Gt, Some(o)) => o == Greater,
+        (CmpOp::Ge, Some(o)) => o != Less,
+    }
+}
+
 /// Sorted-vector intersection.
 fn intersect(a: Vec<Id>, b: &[Id]) -> Vec<Id> {
     let set: HashSet<Id> = b.iter().copied().collect();
@@ -333,18 +380,75 @@ impl Kb {
             clauses.push((w.clone(), parse_clause(w)?));
         }
 
-        let mut result: Option<Vec<Id>> = None;
+        // resolve every clause first; a term missing from the index matches nothing
+        let mut resolved: Vec<(Id, Vec<PropCond>)> = Vec::new();
         let mut shown: Vec<Id> = Vec::new();
+        let mut impossible = false;
         for (text, clause) in &clauses {
-            let Some((pid, conds)) = resolve(&onto, &r, text, clause)? else {
-                result = Some(Vec::new());
-                break;
-            };
-            if !text.starts_with("rdf:type") {
-                shown.push(pid);
+            match resolve(&onto, &r, text, clause)? {
+                Some((pid, conds)) => {
+                    if !text.starts_with("rdf:type") {
+                        shown.push(pid);
+                    }
+                    resolved.push((pid, conds));
+                }
+                None => impossible = true,
             }
+        }
+        let offset: usize = match &q.cursor {
+            Some(c) => c
+                .parse()
+                .map_err(|_| Error::other(format!("invalid cursor '{c}'")))?,
+            None => 0,
+        };
+        let limit = q.limit.max(1);
+        let window = offset + limit;
+
+        // Semantic search with loose filters: rank without the filter and check it on the
+        // nearest hits (cheap key lookups), widening until enough pass. Materialising a
+        // candidate set covering most of the data would cost far more. Tight filters fall
+        // through to the candidate-set path below.
+        let mut postfiltered: Option<Ranked> = None;
+        if let (Some(qv), None, false, false) = (&qvec, &q.text, resolved.is_empty(), impossible) {
+            // first round sized for loose filters; its pass rate estimates how many
+            // neighbours a second round would need, or says to fall back
+            let mut pool = (window * 8).max(80);
+            for _round in 0..2 {
+                let (near, _) = vectors::rank(&r, &self.index_dir(), qv, None, pool)?;
+                let checked = near.len();
+                let exhausted = checked < pool;
+                let mut pass = Vec::new();
+                for (id, score) in near {
+                    if resolved
+                        .iter()
+                        .all(|(pid, conds)| matches(&r, id, *pid, conds).unwrap_or(false))
+                    {
+                        pass.push((id, Some(score)));
+                    }
+                }
+                if pass.len() >= window || exhausted {
+                    let total = pass.len();
+                    postfiltered =
+                        Some((pass.into_iter().skip(offset).take(limit).collect(), total));
+                    break;
+                }
+                let rate = pass.len().max(1) as f64 / checked.max(1) as f64;
+                let needed = (window as f64 / rate * 1.5) as usize;
+                if needed > POSTFILTER_MAX_POOL {
+                    break; // tight filter: the candidate-set path is faster
+                }
+                pool = needed.max(pool * 2);
+            }
+        }
+
+        let mut result: Option<Vec<Id>> = if impossible { Some(Vec::new()) } else { None };
+        for (pid, conds) in resolved
+            .iter()
+            .filter(|_| postfiltered.is_none() && !impossible)
+        {
+            let (pid, conds) = (*pid, conds);
             let mut ids: Vec<Id> = Vec::new();
-            for c in &conds {
+            for c in conds.iter() {
                 ids.extend(r.subjects_where(pid, c)?);
             }
             ids.sort_unstable();
@@ -357,16 +461,9 @@ impl Kb {
                 break;
             }
         }
-        let offset: usize = match &q.cursor {
-            Some(c) => c
-                .parse()
-                .map_err(|_| Error::other(format!("invalid cursor '{c}'")))?,
-            None => 0,
-        };
-        let limit = q.limit.max(1);
         // (entity, score) in result order, and the total number of matches
-        let window = offset + limit;
         let (page, total): (Vec<(Id, Option<f32>)>, usize) = match (&q.text, fts, &qvec) {
+            _ if postfiltered.is_some() => postfiltered.take().expect("checked"),
             (Some(text), Some(fts), Some(qv)) if q.text_mode == TextMode::Must => {
                 // text is a condition: every text match (within the filters), ranked by meaning
                 let candidates = result

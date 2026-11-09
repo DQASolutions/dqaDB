@@ -277,6 +277,13 @@ pub fn search(
     let stale: HashSet<u64> = r.vec_changed_since(meta.seq)?.into_iter().collect();
     let (file, _) = files(dir);
     let index = open_cached(&file, meta)?;
+    let ef = std::env::var("DQADB_HNSW_EF")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(EXPANSION_SEARCH);
+    if index.expansion_search() != ef {
+        index.change_expansion_search(ef);
+    }
     // an i8 base only proposes candidates; their f16 vectors give the exact order
     let pool = if meta.quant == "i8" {
         (n * 8).max(64)

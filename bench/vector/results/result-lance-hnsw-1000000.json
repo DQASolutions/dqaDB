@@ -1,0 +1,110 @@
+{
+  "system": "LanceDB IVF_HNSW_SQ",
+  "version": "lancedb 0.41.0 (lance 14.0.2)",
+  "n": 1000000,
+  "insert_s": 0.0,
+  "index_s": 0.0,
+  "disk_mb": 4062.197726,
+  "peak_rss_mb": 1782.62890625,
+  "points": [
+    {
+      "system": "LanceDB IVF_HNSW_SQ",
+      "case": "search",
+      "param": "ef=32",
+      "recall_at_10": 0.920599999999996,
+      "p50_ms": 2.957319,
+      "p95_ms": 3.4212230000000003,
+      "p99_ms": 4.244979000000001,
+      "qps_1_thread": 331.7985992443273,
+      "qps_4_threads": 853.2480999005265
+    },
+    {
+      "system": "LanceDB IVF_HNSW_SQ",
+      "case": "search",
+      "param": "ef=64",
+      "recall_at_10": 0.9519999999999964,
+      "p50_ms": 3.160386,
+      "p95_ms": 4.048728,
+      "p99_ms": 5.099361999999999,
+      "qps_1_thread": 305.70522084088446,
+      "qps_4_threads": 761.5287361311254
+    },
+    {
+      "system": "LanceDB IVF_HNSW_SQ",
+      "case": "search",
+      "param": "ef=128",
+      "recall_at_10": 0.9677999999999966,
+      "p50_ms": 5.229846,
+      "p95_ms": 10.243742000000001,
+      "p99_ms": 10.898745,
+      "qps_1_thread": 162.70564294010572,
+      "qps_4_threads": 603.8817038859241
+    },
+    {
+      "system": "LanceDB IVF_HNSW_SQ",
+      "case": "search",
+      "param": "ef=256",
+      "recall_at_10": 0.9743999999999964,
+      "p50_ms": 8.913839999999999,
+      "p95_ms": 13.012929,
+      "p99_ms": 14.196046,
+      "qps_1_thread": 113.96241602689204,
+      "qps_4_threads": 475.0751361851455
+    },
+    {
+      "system": "LanceDB IVF_HNSW_SQ",
+      "case": "search",
+      "param": "ef=512",
+      "recall_at_10": 0.9763999999999966,
+      "p50_ms": 6.952024000000001,
+      "p95_ms": 9.541318,
+      "p99_ms": 10.907645,
+      "qps_1_thread": 138.7389714487403,
+      "qps_4_threads": 314.3888730089148
+    },
+    {
+      "system": "LanceDB IVF_HNSW_SQ",
+      "case": "filter keep 1%",
+      "param": "default",
+      "recall_at_10": 0.9660000000000011,
+      "p50_ms": 10.684512999999999,
+      "p95_ms": 11.816189,
+      "p99_ms": 12.817670999999999,
+      "qps_1_thread": 92.82372103656299,
+      "qps_4_threads": 186.30287495545065
+    },
+    {
+      "system": "LanceDB IVF_HNSW_SQ",
+      "case": "filter keep 10%",
+      "param": "default",
+      "recall_at_10": 0.9310000000000014,
+      "p50_ms": 13.483944,
+      "p95_ms": 14.943878000000002,
+      "p99_ms": 21.593193,
+      "qps_1_thread": 72.79008760833698,
+      "qps_4_threads": 155.7595029817061
+    },
+    {
+      "system": "LanceDB IVF_HNSW_SQ",
+      "case": "filter keep 50%",
+      "param": "default",
+      "recall_at_10": 0.8780000000000012,
+      "p50_ms": 23.577372,
+      "p95_ms": 26.037411,
+      "p99_ms": 30.099352999999997,
+      "qps_1_thread": 42.122142404873955,
+      "qps_4_threads": 84.10024090715848
+    },
+    {
+      "system": "LanceDB IVF_HNSW_SQ",
+      "case": "filter keep 99%",
+      "param": "default",
+      "recall_at_10": 0.8600000000000011,
+      "p50_ms": 36.123305,
+      "p95_ms": 41.685465,
+      "p99_ms": 45.958265,
+      "qps_1_thread": 27.383126417005766,
+      "qps_4_threads": 63.71619290723994
+    }
+  ]
+}

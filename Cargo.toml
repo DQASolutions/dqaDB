@@ -1,6 +1,8 @@
 [workspace]
 resolver = "3"
 members = ["crates/dqadb-core", "crates/dqadb-cli"]
+# benchmarks have heavy dependencies (LanceDB); built on their own
+exclude = ["bench"]
 
 [workspace.package]
 version = "0.1.0"

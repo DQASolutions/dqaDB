@@ -1,0 +1,143 @@
+{
+  "system": "LanceDB IVF_PQ",
+  "version": "lancedb 0.41.0 (lance 14.0.2)",
+  "n": 1000000,
+  "insert_s": 0.0,
+  "index_s": 0.0,
+  "disk_mb": 3133.355436,
+  "peak_rss_mb": 226.25390625,
+  "points": [
+    {
+      "system": "LanceDB IVF_PQ",
+      "case": "search",
+      "param": "nprobes=5",
+      "recall_at_10": 0.5540000000000012,
+      "p50_ms": 9.576167,
+      "p95_ms": 13.86064,
+      "p99_ms": 14.839483000000001,
+      "qps_1_thread": 108.64223990534188,
+      "qps_4_threads": 525.6834445815216
+    },
+    {
+      "system": "LanceDB IVF_PQ",
+      "case": "search",
+      "param": "nprobes=10",
+      "recall_at_10": 0.5710000000000017,
+      "p50_ms": 8.635106,
+      "p95_ms": 17.222268,
+      "p99_ms": 18.918707,
+      "qps_1_thread": 103.76918348973179,
+      "qps_4_threads": 373.45394989666744
+    },
+    {
+      "system": "LanceDB IVF_PQ",
+      "case": "search",
+      "param": "nprobes=20",
+      "recall_at_10": 0.5758000000000013,
+      "p50_ms": 8.584309,
+      "p95_ms": 10.163541,
+      "p99_ms": 11.635174999999998,
+      "qps_1_thread": 114.20766078937807,
+      "qps_4_threads": 246.05761597293053
+    },
+    {
+      "system": "LanceDB IVF_PQ",
+      "case": "search",
+      "param": "nprobes=50",
+      "recall_at_10": 0.5772000000000013,
+      "p50_ms": 16.505413,
+      "p95_ms": 20.498932,
+      "p99_ms": 24.539933,
+      "qps_1_thread": 58.89478074016082,
+      "qps_4_threads": 120.75269052314982
+    },
+    {
+      "system": "LanceDB IVF_PQ",
+      "case": "search",
+      "param": "nprobes=100",
+      "recall_at_10": 0.5772000000000013,
+      "p50_ms": 31.463777999999998,
+      "p95_ms": 60.159698999999996,
+      "p99_ms": 68.13255699999999,
+      "qps_1_thread": 27.024654402606526,
+      "qps_4_threads": 65.39600425042403
+    },
+    {
+      "system": "LanceDB IVF_PQ",
+      "case": "search",
+      "param": "nprobes=10,refine=10",
+      "recall_at_10": 0.8901999999999971,
+      "p50_ms": 9.217005,
+      "p95_ms": 13.833454,
+      "p99_ms": 17.981154,
+      "qps_1_thread": 100.0661016454117,
+      "qps_4_threads": 209.68491006077937
+    },
+    {
+      "system": "LanceDB IVF_PQ",
+      "case": "search",
+      "param": "nprobes=20,refine=10",
+      "recall_at_10": 0.915399999999997,
+      "p50_ms": 13.939696999999999,
+      "p95_ms": 49.084094,
+      "p99_ms": 73.587975,
+      "qps_1_thread": 53.122146706576224,
+      "qps_4_threads": 122.94724428564619
+    },
+    {
+      "system": "LanceDB IVF_PQ",
+      "case": "search",
+      "param": "nprobes=50,refine=10",
+      "recall_at_10": 0.9245999999999976,
+      "p50_ms": 23.307644999999997,
+      "p95_ms": 32.802509,
+      "p99_ms": 46.484918,
+      "qps_1_thread": 40.223255862441405,
+      "qps_4_threads": 73.81962074493802
+    },
+    {
+      "system": "LanceDB IVF_PQ",
+      "case": "filter keep 1%",
+      "param": "default",
+      "recall_at_10": 0.41100000000000014,
+      "p50_ms": 6.668799000000001,
+      "p95_ms": 14.851691,
+      "p99_ms": 17.505141,
+      "qps_1_thread": 133.94375664422145,
+      "qps_4_threads": 270.8036828970493
+    },
+    {
+      "system": "LanceDB IVF_PQ",
+      "case": "filter keep 10%",
+      "param": "default",
+      "recall_at_10": 0.47999999999999987,
+      "p50_ms": 10.750309,
+      "p95_ms": 26.613247,
+      "p99_ms": 41.099093,
+      "qps_1_thread": 80.78926017467265,
+      "qps_4_threads": 157.59987643161048
+    },
+    {
+      "system": "LanceDB IVF_PQ",
+      "case": "filter keep 50%",
+      "param": "default",
+      "recall_at_10": 0.5374999999999998,
+      "p50_ms": 28.232132,
+      "p95_ms": 79.939809,
+      "p99_ms": 95.03121300000001,
+      "qps_1_thread": 29.108790313833453,
+      "qps_4_threads": 54.58676585948133
+    },
+    {
+      "system": "LanceDB IVF_PQ",
+      "case": "filter keep 99%",
+      "param": "default",
+      "recall_at_10": 0.5585000000000001,
+      "p50_ms": 47.724545,
+      "p95_ms": 141.26684,
+      "p99_ms": 163.79945600000002,
+      "qps_1_thread": 17.044314104103066,
+      "qps_4_threads": 30.516675881708448
+    }
+  ]
+}

@@ -826,3 +826,50 @@ fn text_mode_must_requires_text_and_traverse_skips_start() {
         .collect();
     assert_eq!(labels, vec!["\"Cảng Mới\""]);
 }
+
+#[test]
+fn semantic_search_with_loose_filters_post_filters_correctly() {
+    use dqadb_core::search::SearchQuery;
+    let (_dir, kb) = hash_kb();
+    let mut list = Vec::new();
+    for n in 0..400 {
+        let country = if n % 10 == 0 { "SG" } else { "VN" };
+        list.push(serde_json::json!({"op": "add", "s": format!("_:o{n}"), "p": "rdf:type", "o": "ex:Company"}));
+        list.push(serde_json::json!({"op": "add", "s": format!("_:o{n}"), "p": "rdfs:label", "o": format!("Org {n} vận tải biển container")}));
+        list.push(serde_json::json!({"op": "add", "s": format!("_:o{n}"), "p": "ex:country", "o": country}));
+    }
+    kb.assert(&ops(serde_json::Value::Array(list)), &opts())
+        .unwrap();
+    kb.embed(true).unwrap();
+    for (filter, want) in [
+        ("ex:country = \"VN\"", "VN"),
+        ("ex:country = \"SG\"", "SG"),
+        ("ex:country != \"SG\"", "VN"),
+    ] {
+        let mut seen = std::collections::HashSet::new();
+        let mut cursor = None;
+        for _ in 0..3 {
+            let page = kb
+                .search(&SearchQuery {
+                    semantic: Some("vận tải biển".into()),
+                    wheres: vec![filter.into()],
+                    limit: 5,
+                    cursor: cursor.clone(),
+                    ..Default::default()
+                })
+                .unwrap();
+            assert_eq!(page.hits.len(), 5, "{filter}");
+            for h in &page.hits {
+                let card = kb.get(&h.iri).unwrap();
+                let c = card.props.iter().find(|p| p.p == "ex:country").unwrap();
+                assert_eq!(c.value, want, "{filter} returned {}", h.iri);
+                assert!(
+                    seen.insert(h.iri.clone()),
+                    "duplicate across pages: {}",
+                    h.iri
+                );
+            }
+            cursor = page.next_cursor;
+        }
+    }
+}
