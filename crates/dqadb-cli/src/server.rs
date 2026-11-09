@@ -3,6 +3,7 @@
 //! - runs the background vectorizer: `embed` on an interval (catch-up by watermark,
 //!   HNSW base rebuild when the delta grows); writes never wait for it;
 //! - advertises itself in `.dqadb/serve.json` (removed on shutdown).
+//!
 //! Listens on 127.0.0.1 only.
 
 use axum::extract::State;

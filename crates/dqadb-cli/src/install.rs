@@ -2,6 +2,7 @@
 //! - model: BAAI/bge-m3 ONNX export from Hugging Face (sha256 from the Hub's LFS metadata)
 //! - runtime: Microsoft's official ONNX Runtime shared library from its PyPI wheel
 //!   (manylinux, glibc 2.27+; sha256 from PyPI)
+//!
 //! Installs into ~/.cache/dqadb/ (the default embedding paths), so no config is needed.
 
 use dqadb_core::{Error, Result};
