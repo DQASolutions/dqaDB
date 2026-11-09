@@ -17,6 +17,7 @@ $B $D $W gt                                   # filtered ground truth (once)
 $B $D $W dqadb; $B $D $W lance-hnsw; $B $D $W lance-pq            # load (+ search)
 BENCH_REUSE=1 $B $D $W dqadb                  # search only, on the built index
 BENCH_REUSE=1 $B $D $W lance-hnsw; BENCH_REUSE=1 $B $D $W lance-pq
+$B $D $W stream-dqadb; $B $D $W stream-lance  # streaming case (first 300k vectors)
 ```
 
 Results: `RESULTS.md`; raw JSON in the work directory.
