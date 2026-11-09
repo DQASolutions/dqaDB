@@ -44,6 +44,13 @@ enum Cmd {
     Rebuild,
     /// Check every event file (parse, name, sharded path)
     Verify,
+    /// Embed entities changed since the last run (rdfs:label + `dqadb_index: vector` fields).
+    /// Uses the cache, so only new or changed text reaches the model.
+    #[command(
+        after_help = "Model: embedding.model_dir / DQADB_MODEL_DIR (model.onnx, model.onnx_data, tokenizer.json)\n\
+        Runtime: embedding.onnxruntime / DQADB_ORT_LIB (official libonnxruntime.so)"
+    )]
+    Embed,
     /// Mint new entity IRIs
     #[command(after_help = "Examples:\n  dqadb new-id\n  dqadb new-id -n 5")]
     NewId {
@@ -126,6 +133,10 @@ enum Cmd {
         /// Full-text query, ranked by BM25 (accents and đ/d ignored)
         #[arg(long)]
         text: Option<String>,
+        /// Semantic query (embedding cosine); combined with --text by RRF.
+        /// Run `dqadb embed` first; the output reports events not yet embedded.
+        #[arg(long)]
+        semantic: Option<String>,
         #[arg(short = 'k', long, default_value_t = 10)]
         limit: usize,
         /// Continue from a previous page
@@ -490,6 +501,21 @@ fn run(cli: Cli) -> Result<()> {
                 }
             );
         }
+        Cmd::Embed => {
+            let r = kb.embed_sync()?;
+            if json {
+                return print_json(&r);
+            }
+            println!(
+                "embedded: {} checked, {} written, {} removed, {} model call(s){} in {:.1}s",
+                r.entities_checked,
+                r.vectors_written,
+                r.vectors_removed,
+                r.model_calls,
+                if r.full_rebuild { " (full)" } else { "" },
+                r.seconds
+            );
+        }
         Cmd::Rebuild => {
             let r = kb.rebuild()?;
             if json {
@@ -649,6 +675,7 @@ fn run(cli: Cli) -> Result<()> {
             types,
             wheres,
             text,
+            semantic,
             limit,
             cursor,
         } => {
@@ -656,6 +683,7 @@ fn run(cli: Cli) -> Result<()> {
                 types,
                 wheres,
                 text,
+                semantic,
                 limit,
                 cursor,
             })?;
@@ -664,6 +692,9 @@ fn run(cli: Cli) -> Result<()> {
             }
             for h in &page.hits {
                 print_hit(h);
+            }
+            if let Some(n) = page.pending.filter(|n| *n > 0) {
+                println!("note: {n} event(s) not embedded yet; run: dqadb embed");
             }
             match &page.next_cursor {
                 Some(c) => println!(

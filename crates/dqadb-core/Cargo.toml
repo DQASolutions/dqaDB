@@ -7,7 +7,9 @@ publish.workspace = true
 
 [dependencies]
 chrono = { version = "0.4.45", default-features = false, features = ["std", "clock"] }
+half = "2.7.1"
 hex = "0.4.3"
+ort = { version = "=2.0.0-rc.15", default-features = false, features = ["std", "load-dynamic"] }
 oxrdf = "0.3.5"
 rayon = "1.12.0"
 rusqlite = { version = "0.41.1", features = ["bundled", "backup"] }
@@ -19,6 +21,7 @@ spareval = "0.2.9"
 spargebra = "0.4.8"
 tantivy = "=0.27.0"
 thiserror = "2.0.21"
+tokenizers = { version = "0.23.2", default-features = false, features = ["onig"] }
 ulid = "3.0.0"
 unicode-normalization = "0.1.26"
 

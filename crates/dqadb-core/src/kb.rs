@@ -29,6 +29,8 @@ pub struct Kb {
     pub config: Config,
     store: Mutex<Option<Arc<Store>>>,
     pub lock_timeout: Duration,
+    /// configured embedding model, loaded on first use
+    pub(crate) embedder: Mutex<crate::embed::LazyEmbedder>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -209,15 +211,17 @@ impl Kb {
                 config.dqadb
             )));
         }
+        let embedder = Mutex::new(crate::embed::LazyEmbedder::new(&config.embedding));
         Ok(Kb {
             root,
             config,
             store: Mutex::new(None),
             lock_timeout: Duration::from_secs(10),
+            embedder,
         })
     }
 
-    fn lock(&self) -> Result<WriteLock> {
+    pub(crate) fn lock(&self) -> Result<WriteLock> {
         std::fs::create_dir_all(self.events_dir())?;
         WriteLock::acquire(&self.events_dir().join(".lock"), self.lock_timeout)
     }
@@ -283,7 +287,7 @@ impl Kb {
         Ok(n)
     }
 
-    fn sync_locked(&self, store: &Store, inference: &Inference) -> Result<usize> {
+    pub(crate) fn sync_locked(&self, store: &Store, inference: &Inference) -> Result<usize> {
         let (wm, rules) = {
             let r = store.read()?;
             (r.watermark()?, r.inference_hash()?)

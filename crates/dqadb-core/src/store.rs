@@ -30,7 +30,8 @@ use crate::{Error, Result};
 
 /// Bump when the layout changes; a mismatch forces `dqadb rebuild`.
 /// 3: SQLite backend (1-2 were LMDB). 4: `props` table for typed literal filters.
-pub const STORE_FORMAT: u32 = 4;
+/// 5: `vecs` / `vec_dead` tables for the vector projection.
+pub const STORE_FORMAT: u32 = 5;
 const PAGE: i64 = 1024;
 const BUSY_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -50,6 +51,10 @@ CREATE TABLE IF NOT EXISTS inf(a INTEGER NOT NULL, b INTEGER NOT NULL, c INTEGER
 CREATE TABLE IF NOT EXISTS props(p INTEGER NOT NULL, s INTEGER NOT NULL, o INTEGER NOT NULL, num REAL, txt TEXT, PRIMARY KEY(p,s,o)) WITHOUT ROWID;
 CREATE INDEX IF NOT EXISTS props_num ON props(p, num) WHERE num IS NOT NULL;
 CREATE INDEX IF NOT EXISTS props_txt ON props(p, txt) WHERE txt IS NOT NULL;
+-- vector projection: one f16 vector per entity; seq orders changes (base vs delta)
+CREATE TABLE IF NOT EXISTS vecs(id INTEGER PRIMARY KEY, seq INTEGER NOT NULL, hash BLOB NOT NULL, vec BLOB NOT NULL);
+CREATE INDEX IF NOT EXISTS vecs_seq ON vecs(seq);
+CREATE TABLE IF NOT EXISTS vec_dead(id INTEGER PRIMARY KEY, seq INTEGER NOT NULL);
 ";
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -68,6 +73,21 @@ pub struct ApplyStats {
     pub added: u64,
     pub retracted: u64,
     pub noop: u64,
+}
+
+/// What the vector projection reflects: the index watermark it caught up to and the
+/// configuration (model id, embedded predicates) it was built with.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VecState {
+    pub watermark: Option<String>,
+    pub config: String,
+}
+
+/// One stored vector: content hash of its text and the f16 bytes.
+#[derive(Debug, Clone)]
+pub struct VecRow {
+    pub hash: [u8; 32],
+    pub vec: Vec<u8>,
 }
 
 /// Comparison in a `--where` filter.
@@ -319,6 +339,68 @@ impl Store {
         Ok(())
     }
 
+    /// Apply vector changes in one short write transaction and record the new state.
+    /// `None` removes the entity's vector. `clear` drops all vectors first (config change).
+    pub fn vec_write(
+        &self,
+        updates: &[(Id, Option<VecRow>)],
+        state: &VecState,
+        clear: bool,
+    ) -> Result<()> {
+        let conn = self.lock();
+        conn.execute_batch("BEGIN IMMEDIATE")?;
+        let r = Reader { conn };
+        let res = (|| -> Result<()> {
+            if clear {
+                r.conn
+                    .execute_batch("DELETE FROM vecs; DELETE FROM vec_dead;")?;
+            }
+            let mut seq = r.meta_u64("vec_seq")?.unwrap_or(0);
+            for (id, row) in updates {
+                seq += 1;
+                match row {
+                    Some(row) => {
+                        r.conn
+                            .prepare_cached("INSERT OR REPLACE INTO vecs(id, seq, hash, vec) VALUES (?1, ?2, ?3, ?4)")?
+                            .execute(params![i(*id), seq as i64, &row.hash[..], &row.vec])?;
+                        r.conn
+                            .prepare_cached("DELETE FROM vec_dead WHERE id = ?1")?
+                            .execute([i(*id)])?;
+                    }
+                    None => {
+                        if r.conn
+                            .prepare_cached("DELETE FROM vecs WHERE id = ?1")?
+                            .execute([i(*id)])?
+                            == 1
+                        {
+                            r.conn
+                                .prepare_cached(
+                                    "INSERT OR REPLACE INTO vec_dead(id, seq) VALUES (?1, ?2)",
+                                )?
+                                .execute(params![i(*id), seq as i64])?;
+                        }
+                    }
+                }
+            }
+            let put = |k: &str, v: Vec<u8>| -> Result<()> {
+                r.conn
+                    .prepare_cached("INSERT OR REPLACE INTO meta VALUES (?1, ?2)")?
+                    .execute(params![k, v])?;
+                Ok(())
+            };
+            put("vec_seq", seq.to_be_bytes().to_vec())?;
+            put("vec_state", serde_json::to_vec(state)?)?;
+            Ok(())
+        })();
+        match res {
+            Ok(()) => {
+                r.conn.execute_batch("COMMIT")?;
+                Ok(())
+            }
+            Err(e) => Err(e), // Reader drop rolls back
+        }
+    }
+
     /// Hash over dictionary, triples, provenance and inferences: equal = identical index.
     pub fn fingerprint(&self) -> Result<String> {
         let r = self.read()?;
@@ -367,6 +449,58 @@ impl Drop for Reader<'_> {
 }
 
 impl Reader<'_> {
+    pub fn vec_state(&self) -> Result<Option<VecState>> {
+        Ok(self
+            .meta("vec_state")?
+            .and_then(|b| serde_json::from_slice(&b).ok()))
+    }
+
+    pub fn vec_count(&self) -> Result<u64> {
+        Ok(self
+            .conn
+            .query_row("SELECT count(*) FROM vecs", [], |r| r.get::<_, i64>(0))? as u64)
+    }
+
+    /// Content hash of the text an entity's stored vector was made from.
+    pub fn vec_hash(&self, id: Id) -> Result<Option<Vec<u8>>> {
+        Ok(self
+            .conn
+            .prepare_cached("SELECT hash FROM vecs WHERE id = ?1")?
+            .query_row([i(id)], |r| r.get(0))
+            .optional()?)
+    }
+
+    /// Visit every stored vector (f16 bytes), in id order.
+    pub fn vec_each(&self, mut f: impl FnMut(Id, &[u8])) -> Result<()> {
+        let mut st = self.conn.prepare("SELECT id, vec FROM vecs ORDER BY id")?;
+        let mut rows = st.query([])?;
+        while let Some(row) = rows.next()? {
+            f(
+                row.get::<_, i64>(0)? as Id,
+                row.get_ref(1)?.as_blob().map_err(rusqlite::Error::from)?,
+            );
+        }
+        Ok(())
+    }
+
+    /// Visit the stored vectors of the given entities.
+    pub fn vec_of(&self, ids: &[Id], mut f: impl FnMut(Id, &[u8])) -> Result<()> {
+        for chunk in ids.chunks(500) {
+            let marks = vec!["?"; chunk.len()].join(",");
+            let mut st = self
+                .conn
+                .prepare_cached(&format!("SELECT id, vec FROM vecs WHERE id IN ({marks})"))?;
+            let mut rows = st.query(rusqlite::params_from_iter(chunk.iter().map(|x| i(*x))))?;
+            while let Some(row) = rows.next()? {
+                f(
+                    row.get::<_, i64>(0)? as Id,
+                    row.get_ref(1)?.as_blob().map_err(rusqlite::Error::from)?,
+                );
+            }
+        }
+        Ok(())
+    }
+
     fn meta(&self, key: &str) -> Result<Option<Vec<u8>>> {
         Ok(self
             .conn

@@ -366,6 +366,7 @@ fn search_traverse_and_path() {
                 limit: 10,
                 cursor: None,
                 text: None,
+                semantic: None,
             })
             .unwrap();
         let mut labels: Vec<String> = page.hits.into_iter().filter_map(|h| h.label).collect();
@@ -526,4 +527,116 @@ fn full_text_is_accent_insensitive_lazy_and_self_repairing() {
     let report = kb.rebuild().unwrap();
     assert_eq!(report.text_documents, 3);
     assert_eq!(text(&kb, "duong sat", &[]), vec!["Beta Đường Sắt"]);
+}
+
+fn hash_kb() -> (tempfile::TempDir, Kb) {
+    let dir = tempfile::tempdir().unwrap();
+    Kb::init(dir.path(), "urn:dqadb:").unwrap();
+    let cfg = dir.path().join("dqadb.yaml");
+    let yaml = std::fs::read_to_string(&cfg).unwrap();
+    std::fs::write(
+        &cfg,
+        yaml.replace("model: bge-m3\n  dim: 1024", "model: hash-test\n  dim: 64"),
+    )
+    .unwrap();
+    let kb = Kb::open(dir.path()).unwrap();
+    assert_eq!(kb.config.embedding.model, "hash-test");
+    kb.build_ontology(true).unwrap();
+    (dir, kb)
+}
+
+#[test]
+fn semantic_search_embeds_lazily_and_reuses_the_cache() {
+    use dqadb_core::search::SearchQuery;
+    let (_dir, kb) = hash_kb();
+    let org = |label: &str, desc: &str| {
+        serde_json::json!([
+            {"op": "add", "s": "_:x", "p": "rdf:type", "o": "ex:Company"},
+            {"op": "add", "s": "_:x", "p": "rdfs:label", "o": label},
+            {"op": "add", "s": "_:x", "p": "ex:description", "o": desc}
+        ])
+    };
+    let a = kb
+        .assert(
+            &ops(org(
+                "ACME",
+                "vận tải biển hàng hóa container cảng Hải Phòng",
+            )),
+            &opts(),
+        )
+        .unwrap();
+    kb.assert(&ops(org("Beta", "rang xay cà phê và trà sữa")), &opts())
+        .unwrap();
+    kb.assert(
+        &ops(org("Gamma", "vận tải đường bộ xe tải liên tỉnh")),
+        &opts(),
+    )
+    .unwrap();
+    let sem = |kb: &Kb, q: &str, types: &[&str], text: Option<&str>| {
+        kb.search(&SearchQuery {
+            semantic: Some(q.into()),
+            text: text.map(Into::into),
+            types: types.iter().map(|s| s.to_string()).collect(),
+            limit: 3,
+            ..Default::default()
+        })
+        .unwrap()
+    };
+
+    // nothing embedded yet: results are empty and pending says why
+    let before = sem(&kb, "vận tải biển", &[], None);
+    assert!(before.hits.is_empty());
+    assert_eq!(before.pending, Some(3));
+
+    let report = kb.embed_sync().unwrap();
+    assert_eq!(
+        (
+            report.vectors_written,
+            report.model_calls,
+            report.full_rebuild
+        ),
+        (3, 3, true)
+    );
+    let page = sem(&kb, "vận tải biển container", &[], None);
+    assert_eq!(page.pending, Some(0));
+    let labels: Vec<_> = page.hits.iter().filter_map(|h| h.label.clone()).collect();
+    assert_eq!(labels[0], "ACME");
+    assert_eq!(labels.last().unwrap(), "Beta");
+
+    // filters restrict the candidates; text + semantic are fused (RRF)
+    assert!(sem(&kb, "vận tải", &["ex:Contract"], None).hits.is_empty());
+    let hybrid = sem(&kb, "xe tải", &["ex:Company"], Some("van tai"));
+    assert_eq!(hybrid.hits[0].label.as_deref(), Some("Gamma"));
+
+    // incremental: only the changed entity is re-embedded
+    let acme = a.id_map["_:x"].replace("urn:dqadb:", "dqadb:");
+    kb.assert(&ops(serde_json::json!([
+        {"op": "retract", "s": acme, "p": "ex:description", "o": "vận tải biển hàng hóa container cảng Hải Phòng"},
+        {"op": "add", "s": acme, "p": "ex:description", "o": "phần mềm kế toán doanh nghiệp"}
+    ])), &opts()).unwrap();
+    assert_eq!(kb.vec_pending().unwrap(), 1);
+    let r = kb.embed_sync().unwrap();
+    assert_eq!(
+        (
+            r.entities_checked,
+            r.vectors_written,
+            r.model_calls,
+            r.full_rebuild
+        ),
+        (1, 1, 1, false)
+    );
+    let top = sem(&kb, "vận tải biển container", &[], None);
+    assert_ne!(top.hits[0].label.as_deref(), Some("ACME"));
+
+    // a rebuild drops the index, but vectors come back from the cache without the model
+    kb.rebuild().unwrap();
+    let r = kb.embed_sync().unwrap();
+    assert_eq!(
+        (r.vectors_written, r.model_calls, r.full_rebuild),
+        (3, 0, true)
+    );
+    assert_eq!(
+        sem(&kb, "cà phê", &[], None).hits[0].label.as_deref(),
+        Some("Beta")
+    );
 }

@@ -11,6 +11,7 @@ use crate::ontology::{Ontology, Range, normalize_lexical};
 use crate::rdf::{self, Literal, Term};
 use crate::sparql::{self, Answer, Limits};
 use crate::store::{CmpOp, Id, PropCond, Reader, literal_key};
+use crate::vectors;
 use crate::{Error, Result};
 
 #[derive(Debug, Clone, Default)]
@@ -21,6 +22,9 @@ pub struct SearchQuery {
     pub wheres: Vec<String>,
     /// full-text query (accents and đ/d ignored); results ranked by BM25
     pub text: Option<String>,
+    /// semantic query, embedded with the configured model; ranked by cosine.
+    /// With `text` too, both rankings are fused (RRF).
+    pub semantic: Option<String>,
     pub limit: usize,
     /// opaque continuation from a previous page
     pub cursor: Option<String>,
@@ -44,6 +48,9 @@ pub struct Hit {
 pub struct SearchPage {
     pub hits: Vec<Hit>,
     pub total: usize,
+    /// with --semantic: events not yet embedded (results may miss very recent entities)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pending: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub next_cursor: Option<String>,
 }
@@ -280,8 +287,10 @@ pub(crate) fn label_of(r: &Reader, id: Id) -> Result<Option<String>> {
 impl Kb {
     /// Entities matching all type and `--where` conditions, in stable (id) order.
     pub fn search(&self, q: &SearchQuery) -> Result<SearchPage> {
-        if q.types.is_empty() && q.wheres.is_empty() && q.text.is_none() {
-            return Err(Error::other("give at least one of --text, --type, --where"));
+        if q.types.is_empty() && q.wheres.is_empty() && q.text.is_none() && q.semantic.is_none() {
+            return Err(Error::other(
+                "give at least one of --text, --semantic, --type, --where",
+            ));
         }
         self.sync()?;
         let onto = self.ontology()?;
@@ -290,6 +299,10 @@ impl Kb {
         let fts = match &q.text {
             Some(_) => Some(self.fts_ready(&store, &onto)?),
             None => None,
+        };
+        let (qvec, pending) = match &q.semantic {
+            Some(s) => (Some(self.embed_query(s)?), Some(self.vec_pending()?)),
+            None => (None, None),
         };
         let r = store.read()?;
 
@@ -339,8 +352,43 @@ impl Kb {
         };
         let limit = q.limit.max(1);
         // (entity, score) in result order, and the total number of matches
-        let (page, total): (Vec<(Id, Option<f32>)>, usize) = match (&q.text, fts) {
-            (Some(text), Some(fts)) => {
+        let window = offset + limit;
+        let (page, total): (Vec<(Id, Option<f32>)>, usize) = match (&q.text, fts, &qvec) {
+            (Some(text), Some(fts), Some(qv)) => {
+                // hybrid: fuse BM25 and cosine rankings (RRF), over the same candidates
+                let pool = window * 4;
+                let candidates = result
+                    .as_ref()
+                    .map(|ids| Arc::new(ids.iter().copied().collect::<HashSet<u64>>()));
+                let (by_text, _) = fts.search(text, candidates, pool, 0)?;
+                let (by_vec, _) = vectors::rank(&r, qv, result.as_deref(), pool)?;
+                let lists = [
+                    by_text.iter().map(|x| x.0).collect(),
+                    by_vec.iter().map(|x| x.0).collect(),
+                ];
+                let all: HashSet<Id> = lists.iter().flatten().copied().collect();
+                let fused = vectors::rrf(&lists, window);
+                (
+                    fused
+                        .into_iter()
+                        .skip(offset)
+                        .map(|(id, sc)| (id, Some(sc)))
+                        .collect(),
+                    all.len(),
+                )
+            }
+            (None, _, Some(qv)) => {
+                let (ranked, total) = vectors::rank(&r, qv, result.as_deref(), window)?;
+                (
+                    ranked
+                        .into_iter()
+                        .skip(offset)
+                        .map(|(id, sc)| (id, Some(sc)))
+                        .collect(),
+                    total,
+                )
+            }
+            (Some(text), Some(fts), None) => {
                 let candidates =
                     result.map(|ids| Arc::new(ids.into_iter().collect::<HashSet<u64>>()));
                 let (ranked, total) = fts.search(text, candidates, limit, offset)?;
@@ -383,6 +431,7 @@ impl Kb {
         let next = offset + hits.len();
         Ok(SearchPage {
             total,
+            pending,
             next_cursor: (next < total).then(|| next.to_string()),
             hits,
         })
