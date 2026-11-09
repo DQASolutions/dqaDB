@@ -256,8 +256,10 @@ impl Cache {
             .query_row([&key[..]], |r| r.get(0))
             .optional()?;
         Ok(blob.map(|b| {
-            b.chunks_exact(4)
-                .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+            b.as_chunks::<4>()
+                .0
+                .iter()
+                .map(|c| f32::from_le_bytes(*c))
                 .collect()
         }))
     }
@@ -359,8 +361,10 @@ pub fn to_f16_bytes(v: &[f32]) -> Vec<u8> {
 }
 
 pub fn from_f16_bytes(b: &[u8]) -> Vec<f32> {
-    b.chunks_exact(2)
-        .map(|c| half::f16::from_le_bytes([c[0], c[1]]).to_f32())
+    b.as_chunks::<2>()
+        .0
+        .iter()
+        .map(|c| half::f16::from_le_bytes(*c).to_f32())
         .collect()
 }
 
