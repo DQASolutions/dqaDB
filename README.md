@@ -48,7 +48,7 @@ Exit codes: 0 ok · 1 error · 2 validation · 3 not found · 4 ontology not bui
 Done: `init`, `status`, `rebuild`, `verify`, `new-id`, `ontology build|show`, `assert`, `validate`, `retract --event`, `get`, `query` (SPARQL 1.1), `search` (`--text` full-text, `--type`, `--where` filters), `traverse`, `path`, `events show|ls`; RDFS subclass inference.
 Validation enforces the LinkML schema directly (known predicates/classes, ranges, enums, required, single-valued).
 
-Not yet: `dqadb serve` (resident model + background embedding), `dqadb model install`, web UI (M3). SHACL: validation runs from LinkML directly; `shapes.ttl` is an export (no runtime SHACL engine until hand-written shapes need one).
+Not yet: web UI (M3). SHACL: validation runs from LinkML directly; `shapes.ttl` is an export (no runtime SHACL engine until hand-written shapes need one).
 
 ## Index store
 
@@ -66,12 +66,14 @@ Full-text runs on tantivy (pinned `=0.27.0`) in `.dqadb/fts/`, as a derived proj
 ## Semantic search
 
 ```bash
-export DQADB_MODEL_DIR=~/.cache/dqadb/models/bge-m3   # model.onnx, model.onnx_data, tokenizer.json (BAAI/bge-m3 onnx/)
-export DQADB_ORT_LIB=/path/to/libonnxruntime.so        # official Microsoft ONNX Runtime >= 1.17
-dqadb embed                                           # embed new/changed entities (cache-backed)
+dqadb model install        # official bge-m3 ONNX (Hugging Face) + official ONNX Runtime (PyPI) -> ~/.cache/dqadb, sha256-verified
+dqadb serve &              # resident: keeps the model loaded, embeds changes in the background, answers query embedding
 dqadb search --semantic "công ty vận chuyển đường biển"
 dqadb search --semantic "ngân hàng" --text "thanh toan" --type ex:Company   # RRF fusion
+dqadb embed                # one-shot catch-up when serve is not running
 ```
+
+Without `dqadb serve`, a semantic search loads the model in-process (~4 s on a 2013 laptop CPU); with it, ~0.3 s. Paths can be overridden with `embedding.model_dir` / `embedding.onnxruntime` in `dqadb.yaml` or `DQADB_MODEL_DIR` / `DQADB_ORT_LIB`.
 
 Embeddings: official BAAI bge-m3 ONNX (fp32) on the official ONNX Runtime, loaded dynamically (glibc 2.27+). Each entity's vector is built from `rdfs:label` and its `dqadb_index: vector` literals; vectors live in the SQLite index (f16) and in `emb-cache/<model>.sqlite` (f32, by content hash), so a rebuild never calls the model again. `assert` never embeds; `dqadb embed` catches up by watermark, filling the cache without holding the write lock. Searches report `pending` events not yet embedded.
 

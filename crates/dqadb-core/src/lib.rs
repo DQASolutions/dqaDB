@@ -12,6 +12,7 @@ pub mod lock;
 pub mod ontology;
 pub mod rdf;
 pub mod search;
+pub mod serve;
 pub mod sparql;
 pub mod store;
 pub mod vectors;

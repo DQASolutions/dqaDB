@@ -30,7 +30,7 @@ pub struct Kb {
     store: Mutex<Option<Arc<Store>>>,
     pub lock_timeout: Duration,
     /// configured embedding model, loaded on first use
-    pub(crate) embedder: Mutex<crate::embed::LazyEmbedder>,
+    pub(crate) embedder: crate::embed::LazyEmbedder,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -211,7 +211,7 @@ impl Kb {
                 config.dqadb
             )));
         }
-        let embedder = Mutex::new(crate::embed::LazyEmbedder::new(&config.embedding));
+        let embedder = crate::embed::LazyEmbedder::new(&config.embedding);
         Ok(Kb {
             root,
             config,

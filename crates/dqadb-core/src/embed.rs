@@ -290,21 +290,16 @@ pub fn model_id(cfg: &EmbeddingConfig) -> String {
 /// Loads the model on first use only: a fully cached run never pays the load cost.
 pub struct LazyEmbedder {
     cfg: EmbeddingConfig,
-    inner: Option<Box<dyn Embedder>>,
+    inner: OnceLock<Box<dyn Embedder>>,
+    init: Mutex<()>,
 }
 
 impl LazyEmbedder {
     pub fn new(cfg: &EmbeddingConfig) -> Self {
         Self {
             cfg: cfg.clone(),
-            inner: None,
-        }
-    }
-
-    pub fn with(embedder: Box<dyn Embedder>, cfg: &EmbeddingConfig) -> Self {
-        Self {
-            cfg: cfg.clone(),
-            inner: Some(embedder),
+            inner: OnceLock::new(),
+            init: Mutex::new(()),
         }
     }
 
@@ -313,21 +308,27 @@ impl LazyEmbedder {
     }
 
     pub fn loaded(&self) -> bool {
-        self.inner.is_some()
+        self.inner.get().is_some()
     }
 
-    pub fn get(&mut self) -> Result<&dyn Embedder> {
-        if self.inner.is_none() {
-            self.inner = Some(load(&self.cfg)?);
+    /// The model, loaded once and shared; each `embed` call locks only for its batch.
+    pub fn get(&self) -> Result<&dyn Embedder> {
+        if let Some(e) = self.inner.get() {
+            return Ok(e.as_ref());
         }
-        Ok(self.inner.as_deref().expect("just loaded"))
+        let _guard = self.init.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(e) = self.inner.get() {
+            return Ok(e.as_ref());
+        }
+        let _ = self.inner.set(load(&self.cfg)?);
+        Ok(self.inner.get().expect("just set").as_ref())
     }
 }
 
 /// Embed `texts`, calling the model only for cache misses, in batches.
 pub fn embed_cached(
     cache: &mut Cache,
-    model: &mut LazyEmbedder,
+    model: &LazyEmbedder,
     texts: &[String],
     batch: usize,
 ) -> Result<Vec<Vec<f32>>> {

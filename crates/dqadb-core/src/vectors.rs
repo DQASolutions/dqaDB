@@ -148,7 +148,7 @@ impl Kb {
         self.sync()?;
         let onto = self.ontology()?;
         let preds = vector_predicates(&onto);
-        let mut model = self.embedder.lock().unwrap_or_else(|p| p.into_inner());
+        let model = &self.embedder;
         let model_id = model.id();
         let config = config_hash(&model_id, &preds);
         let batch = self.config.embedding.batch_size;
@@ -171,7 +171,7 @@ impl Kb {
                 .collect();
             drop(r);
             report.model_calls += count_misses(&cache, &model_id, &texts)?;
-            embed::embed_cached(&mut cache, &mut model, &texts, batch)?;
+            embed::embed_cached(&mut cache, model, &texts, batch)?;
         }
 
         // phase 2: write lock, catch up and store (fast: nearly everything is cached)
@@ -203,7 +203,7 @@ impl Kb {
             }
         }
         report.model_calls += count_misses(&cache, &model_id, &texts)?;
-        let vecs = embed::embed_cached(&mut cache, &mut model, &texts, batch)?;
+        let vecs = embed::embed_cached(&mut cache, model, &texts, batch)?;
         let mut vecs = vecs.into_iter();
         let mut updates: Vec<(Id, Option<VecRow>)> = Vec::new();
         for (s, text) in keyed {
@@ -244,13 +244,32 @@ impl Kb {
         Ok(event::list_after(&self.events_dir(), wm)?.len())
     }
 
-    /// Embed a query text with the configured model (loads it on first use).
+    /// Embed a query text: through a running `dqadb serve` when there is one (model
+    /// already in memory), otherwise with the model loaded in this process.
     pub fn embed_query(&self, text: &str) -> Result<Vec<f32>> {
-        let mut model = self.embedder.lock().unwrap_or_else(|p| p.into_inner());
-        let v = model.get()?.embed(&[text.to_string()])?;
-        v.into_iter()
+        let texts = [text.to_string()];
+        if let Some(remote) =
+            crate::serve::embed_remote(&self.index_dir(), &self.embedder.id(), &texts)
+        {
+            return remote?
+                .into_iter()
+                .next()
+                .ok_or_else(|| Error::other("empty embedding"));
+        }
+        self.embed_texts_local(&texts)?
+            .into_iter()
             .next()
             .ok_or_else(|| Error::other("empty embedding"))
+    }
+
+    /// Embed texts with the model in this process (used by `dqadb serve` itself).
+    pub fn embed_texts_local(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+        self.embedder.get()?.embed(texts)
+    }
+
+    /// Model id of the configured embedder, and whether it is loaded in this process.
+    pub fn embedder_status(&self) -> (String, bool) {
+        (self.embedder.id(), self.embedder.loaded())
     }
 }
 

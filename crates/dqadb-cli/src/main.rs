@@ -1,6 +1,9 @@
 //! `dqadb` — the CLI harness for agents and people (spec §12).
 
 use clap::{Args, Parser, Subcommand};
+
+mod install;
+mod server;
 use dqadb_core::kb::{Card, EventSummary, WriteResult};
 use dqadb_core::ontology::{InputOp, Range};
 use dqadb_core::rdf::Prefixes;
@@ -50,6 +53,16 @@ enum Cmd {
         after_help = "Model: embedding.model_dir / DQADB_MODEL_DIR (model.onnx, model.onnx_data, tokenizer.json)\n\
         Runtime: embedding.onnxruntime / DQADB_ORT_LIB (official libonnxruntime.so)"
     )]
+    /// Resident process: keeps the embedding model loaded, embeds changes in the
+    /// background and answers query embedding for other `dqadb` commands
+    #[command(after_help = "Example:\n  dqadb serve --port 7700 --interval 10")]
+    Serve {
+        #[arg(long, default_value_t = 7700)]
+        port: u16,
+        /// Seconds between background embedding runs
+        #[arg(long, default_value_t = 10)]
+        interval: u64,
+    },
     Embed {
         /// Rebuild the HNSW base now (normally done when the delta grows past 10%)
         #[arg(long)]
@@ -64,6 +77,9 @@ enum Cmd {
     /// Ontology (LinkML) commands
     #[command(subcommand)]
     Ontology(OntologyCmd),
+    /// Embedding model and runtime
+    #[command(subcommand)]
+    Model(ModelCmd),
     /// Validate ops and append them as one event
     #[command(
         after_help = "Input: a JSON array of ops, or {\"ops\": [...], \"note\": \"...\"}.\n\
@@ -188,6 +204,19 @@ enum OntologyCmd {
         #[arg(long)]
         class: Option<String>,
     },
+}
+
+#[derive(Subcommand)]
+enum ModelCmd {
+    /// Download the official bge-m3 ONNX model (Hugging Face) and the official ONNX
+    /// Runtime (PyPI) into ~/.cache/dqadb/, verifying sha256
+    Install {
+        /// Skip the ONNX Runtime library
+        #[arg(long)]
+        no_runtime: bool,
+    },
+    /// Show where the model and runtime are looked up, and whether they are present
+    Status,
 }
 
 #[derive(Subcommand)]
@@ -474,11 +503,53 @@ fn run(cli: Cli) -> Result<()> {
         println!("Next: edit ontology/schema.linkml.yaml, then: dqadb ontology build");
         return Ok(());
     }
+    if let Cmd::Model(cmd) = &cli.cmd {
+        let cfg = Kb::open(&cli.kb.clone().unwrap_or_else(|| PathBuf::from(".")))
+            .map(|kb| kb.config.embedding.clone())
+            .unwrap_or_default();
+        let model_dir = dqadb_core::embed::model_dir(&cfg);
+        let lib = dqadb_core::embed::ort_lib(&cfg);
+        match cmd {
+            ModelCmd::Install { no_runtime } => {
+                if cfg.model != "bge-m3" {
+                    return Err(Error::other(format!(
+                        "model install supports bge-m3; configured: {}",
+                        cfg.model
+                    )));
+                }
+                install::install_model(&model_dir)?;
+                if !no_runtime {
+                    let dir = lib
+                        .parent()
+                        .map(PathBuf::from)
+                        .unwrap_or_else(|| install::cache_root().join("onnxruntime"));
+                    install::install_runtime(&dir)?;
+                }
+                println!(
+                    "installed. model: {}  runtime: {}",
+                    model_dir.display(),
+                    lib.display()
+                );
+            }
+            ModelCmd::Status => {
+                let present = |p: &std::path::Path| if p.exists() { "ok" } else { "missing" };
+                for f in ["model.onnx", "model.onnx_data", "tokenizer.json"] {
+                    println!(
+                        "{:8} {}",
+                        present(&model_dir.join(f)),
+                        model_dir.join(f).display()
+                    );
+                }
+                println!("{:8} {}", present(&lib), lib.display());
+            }
+        }
+        return Ok(());
+    }
     let start = cli.kb.clone().unwrap_or_else(|| PathBuf::from("."));
     let kb = Kb::open(&start)?;
 
     match cli.cmd {
-        Cmd::Init { .. } => unreachable!(),
+        Cmd::Init { .. } | Cmd::Model(_) => unreachable!(),
         Cmd::Status => {
             let s = kb.status()?;
             if json {
@@ -504,6 +575,9 @@ fn run(cli: Cli) -> Result<()> {
                     "behind: next command catches up, or run: dqadb rebuild"
                 }
             );
+        }
+        Cmd::Serve { port, interval } => {
+            return server::run(kb, port, std::time::Duration::from_secs(interval));
         }
         Cmd::Embed { compact } => {
             let r = kb.embed(compact)?;
