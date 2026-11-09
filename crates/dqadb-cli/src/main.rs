@@ -7,7 +7,13 @@ mod server;
 use dqadb_core::kb::{Card, EventSummary, WriteResult};
 use dqadb_core::ontology::{InputOp, Range};
 use dqadb_core::rdf::Prefixes;
-use dqadb_core::search::{Hit, SearchQuery};
+use dqadb_core::search::{Hit, SearchQuery, TextMode};
+
+#[derive(Clone, Copy, clap::ValueEnum)]
+enum TextModeArg {
+    Must,
+    Fuse,
+}
 use dqadb_core::sparql::{self, Answer, Limits};
 use dqadb_core::{Error, Kb, Result, WriteOpts};
 use std::io::Read;
@@ -153,7 +159,11 @@ enum Cmd {
         /// Full-text query, ranked by BM25 (accents and đ/d ignored)
         #[arg(long)]
         text: Option<String>,
-        /// Semantic query (embedding cosine); combined with --text by RRF.
+        /// How --text combines with --semantic: must (text required, ranked by meaning)
+        /// or fuse (RRF of both rankings)
+        #[arg(long, value_enum, default_value_t = TextModeArg::Must)]
+        text_mode: TextModeArg,
+        /// Semantic query (embedding cosine); see --text-mode for combining with --text.
         /// Run `dqadb embed` first; the output reports events not yet embedded.
         #[arg(long)]
         semantic: Option<String>,
@@ -414,7 +424,11 @@ fn print_hit(h: &Hit) {
     } else {
         format!("  {}", matched.join(" "))
     };
-    println!("{}{label}{types}{matched}", h.iri);
+    let score = h
+        .score
+        .map(|s| format!("  score={s:.3}"))
+        .unwrap_or_default();
+    println!("{}{label}{types}{matched}{score}", h.iri);
 }
 
 /// Tab-separated rows with a header; terms compacted with the KB prefixes.
@@ -762,15 +776,21 @@ fn run(cli: Cli) -> Result<()> {
             types,
             wheres,
             text,
+            text_mode,
             semantic,
             limit,
             cursor,
         } => {
+            let text_mode = match text_mode {
+                TextModeArg::Must => TextMode::Must,
+                TextModeArg::Fuse => TextMode::Fuse,
+            };
             let page = kb.search(&SearchQuery {
                 types,
                 wheres,
                 text,
                 semantic,
+                text_mode,
                 limit,
                 cursor,
             })?;

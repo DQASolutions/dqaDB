@@ -69,7 +69,8 @@ Full-text runs on tantivy (pinned `=0.27.0`) in `.dqadb/fts/`, as a derived proj
 dqadb model install        # official bge-m3 ONNX (Hugging Face) + official ONNX Runtime (PyPI) -> ~/.cache/dqadb, sha256-verified
 dqadb serve &              # resident: keeps the model loaded, embeds changes in the background, answers query embedding
 dqadb search --semantic "công ty vận chuyển đường biển"
-dqadb search --semantic "ngân hàng" --text "thanh toan" --type ex:Company   # RRF fusion
+dqadb search --semantic "vận tải hàng hóa" --text "container"               # text required, ranked by meaning
+dqadb search --semantic "vận tải hàng hóa" --text "container" --text-mode fuse   # RRF of both rankings
 dqadb embed                # one-shot catch-up when serve is not running
 ```
 

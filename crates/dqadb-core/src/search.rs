@@ -14,6 +14,16 @@ use crate::store::{CmpOp, Id, PropCond, Reader, literal_key};
 use crate::vectors;
 use crate::{Error, Result};
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TextMode {
+    /// text is a required condition; results ranked by semantic similarity
+    #[default]
+    Must,
+    /// BM25 and semantic rankings merged with Reciprocal Rank Fusion
+    Fuse,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct SearchQuery {
     /// class CURIEs/IRIs; entity must have all of them (inferred types count)
@@ -23,8 +33,11 @@ pub struct SearchQuery {
     /// full-text query (accents and đ/d ignored); results ranked by BM25
     pub text: Option<String>,
     /// semantic query, embedded with the configured model; ranked by cosine.
-    /// With `text` too, both rankings are fused (RRF).
+    /// With `text` too, see `text_mode`.
     pub semantic: Option<String>,
+    /// How `text` combines with `semantic`: `Must` (default) keeps only text matches and
+    /// ranks them by meaning; `Fuse` merges both rankings with RRF.
+    pub text_mode: TextMode,
     pub limit: usize,
     /// opaque continuation from a previous page
     pub cursor: Option<String>,
@@ -354,6 +367,24 @@ impl Kb {
         // (entity, score) in result order, and the total number of matches
         let window = offset + limit;
         let (page, total): (Vec<(Id, Option<f32>)>, usize) = match (&q.text, fts, &qvec) {
+            (Some(text), Some(fts), Some(qv)) if q.text_mode == TextMode::Must => {
+                // text is a condition: every text match (within the filters), ranked by meaning
+                let candidates = result
+                    .as_ref()
+                    .map(|ids| Arc::new(ids.iter().copied().collect::<HashSet<u64>>()));
+                let (_, n) = fts.search(text, candidates.clone(), 1, 0)?;
+                let (matches, _) = fts.search(text, candidates, n.max(1), 0)?;
+                let ids: Vec<Id> = matches.into_iter().map(|(id, _)| id).collect();
+                let (ranked, total) = vectors::rank(&r, &self.index_dir(), qv, Some(&ids), window)?;
+                (
+                    ranked
+                        .into_iter()
+                        .skip(offset)
+                        .map(|(id, sc)| (id, Some(sc)))
+                        .collect(),
+                    total,
+                )
+            }
             (Some(text), Some(fts), Some(qv)) => {
                 // hybrid: fuse BM25 and cosine rankings (RRF), over the same candidates
                 let pool = window * 4;
@@ -444,7 +475,14 @@ impl Kb {
     pub fn traverse(&self, iri: &str, path: &str, limit: usize) -> Result<Vec<Hit>> {
         let onto = self.ontology()?;
         let start = onto.prefixes.expand(iri).map_err(Error::Other)?;
-        let query = format!("SELECT DISTINCT ?x WHERE {{ <{start}> {path} ?x }} ORDER BY ?x");
+        // The start entity is never a result, nor the node a final step is read from
+        // (so `p/^p/rdfs:label` lists the partners' labels, not the start's own label).
+        let query = match split_last_step(path) {
+            Some((head, last)) => format!(
+                "SELECT DISTINCT ?x WHERE {{ <{start}> {head} ?m . FILTER(?m != <{start}>) ?m {last} ?x }} ORDER BY ?x"
+            ),
+            None => format!("SELECT DISTINCT ?x WHERE {{ <{start}> {path} ?x }} ORDER BY ?x"),
+        };
         let answer = self.query(
             &query,
             &Limits {
@@ -463,6 +501,10 @@ impl Kb {
                 continue;
             };
             let t = sparql::from_ox(&term);
+            // paths that come back (e.g. `p/^p`) would list the start entity itself
+            if t.as_ref().and_then(Term::as_iri) == Some(start.as_str()) {
+                continue;
+            }
             let id = match &t {
                 Some(t) => r.term_id(t)?,
                 None => None,
@@ -563,9 +605,44 @@ impl Kb {
     }
 }
 
+/// Split a SPARQL property path at its last top-level `/` (outside parentheses, `<IRI>`s
+/// and quotes): `a/(b|c)/d` -> (`a/(b|c)`, `d`).
+fn split_last_step(path: &str) -> Option<(&str, &str)> {
+    let (mut depth, mut in_iri, mut in_quote, mut at) = (0i32, false, false, None);
+    for (i, c) in path.char_indices() {
+        match c {
+            '"' if !in_iri => in_quote = !in_quote,
+            '<' if !in_quote => in_iri = true,
+            '>' if !in_quote => in_iri = false,
+            '(' if !in_iri && !in_quote => depth += 1,
+            ')' if !in_iri && !in_quote => depth -= 1,
+            '/' if depth == 0 && !in_iri && !in_quote => at = Some(i),
+            _ => {}
+        }
+    }
+    let i = at?;
+    let (head, last) = (path[..i].trim(), path[i + 1..].trim());
+    (!head.is_empty() && !last.is_empty()).then_some((head, last))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn splits_property_paths_at_the_last_top_level_step() {
+        assert_eq!(split_last_step("a/b/c"), Some(("a/b", "c")));
+        assert_eq!(
+            split_last_step("ex:p/(ex:q/ex:r)"),
+            Some(("ex:p", "(ex:q/ex:r)"))
+        );
+        assert_eq!(
+            split_last_step("<http://x/a/b>/ex:q"),
+            Some(("<http://x/a/b>", "ex:q"))
+        );
+        assert_eq!(split_last_step("<http://x/a/b>"), None);
+        assert_eq!(split_last_step("ex:p|ex:q"), None);
+    }
 
     #[test]
     fn parses_where_clauses() {

@@ -183,6 +183,22 @@ pub fn install_runtime(dest_dir: &Path) -> Result<PathBuf> {
         "x86_64"
     };
     std::fs::create_dir_all(dest_dir)?;
+    // already installed and untouched? (version + sha256 of the extracted library)
+    let record = dest_dir.join("installed.json");
+    let lib_path = dest_dir.join("libonnxruntime.so");
+    if let Ok(prev) =
+        std::fs::read(&record).map(|b| serde_json::from_slice::<serde_json::Value>(&b))
+        && let Ok(prev) = prev
+        && prev["version"] == ORT_VERSION
+        && lib_path.exists()
+        && prev["lib_sha256"].as_str() == Some(sha256_file(&lib_path)?.as_str())
+    {
+        eprintln!(
+            "ONNX Runtime {ORT_VERSION}: ok (already installed, sha256 verified): {}",
+            lib_path.display()
+        );
+        return Ok(lib_path);
+    }
     let meta = get_json(&format!(
         "https://pypi.org/pypi/onnxruntime/{ORT_VERSION}/json"
     ))?;
@@ -236,6 +252,8 @@ pub fn install_runtime(dest_dir: &Path) -> Result<PathBuf> {
     }
     let _ = std::fs::remove_file(&wheel);
     let lib = lib.ok_or_else(|| Error::other("libonnxruntime.so not found in the wheel"))?;
+    let info = serde_json::json!({ "version": ORT_VERSION, "wheel_sha256": sha, "lib_sha256": sha256_file(&lib)? });
+    std::fs::write(&record, serde_json::to_vec_pretty(&info)?)?;
     eprintln!("  ok: {}", lib.display());
     Ok(lib)
 }

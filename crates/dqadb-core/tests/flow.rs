@@ -367,6 +367,7 @@ fn search_traverse_and_path() {
                 cursor: None,
                 text: None,
                 semantic: None,
+                text_mode: Default::default(),
             })
             .unwrap();
         let mut labels: Vec<String> = page.hits.into_iter().filter_map(|h| h.label).collect();
@@ -744,4 +745,84 @@ fn hnsw_base_plus_delta_matches_exact_and_stays_correct() {
     let c = kb.embed(true).unwrap().compaction.unwrap();
     assert_eq!(c.vectors, 299);
     assert_eq!(sem("trí tuệ nhân tạo", 1), vec!["Org 0 trí tuệ nhân tạo"]);
+}
+
+#[test]
+fn text_mode_must_requires_text_and_traverse_skips_start() {
+    use dqadb_core::search::{SearchQuery, TextMode};
+    let (_dir, kb) = hash_kb();
+    let mut ids = std::collections::HashMap::new();
+    for (k, label, desc) in [
+        (
+            "rail",
+            "Đường Sắt Hàng Hóa",
+            "vận tải hàng hóa bằng đường sắt",
+        ),
+        ("ship", "Vinaship", "hãng tàu container vận tải biển"),
+        ("port", "Cảng Mới", "kho bãi container tại cảng"),
+    ] {
+        let r = kb
+            .assert(
+                &ops(serde_json::json!([
+                    {"op": "add", "s": "_:x", "p": "rdf:type", "o": "ex:Company"},
+                    {"op": "add", "s": "_:x", "p": "rdfs:label", "o": label},
+                    {"op": "add", "s": "_:x", "p": "ex:description", "o": desc}
+                ])),
+                &opts(),
+            )
+            .unwrap();
+        ids.insert(k, r.id_map["_:x"].replace("urn:dqadb:", "dqadb:"));
+    }
+    kb.embed_sync().unwrap();
+    let run = |mode: TextMode| -> Vec<String> {
+        kb.search(&SearchQuery {
+            semantic: Some("vận tải hàng hóa".into()),
+            text: Some("container".into()),
+            text_mode: mode,
+            limit: 3,
+            ..Default::default()
+        })
+        .unwrap()
+        .hits
+        .into_iter()
+        .filter_map(|h| h.label)
+        .collect()
+    };
+    // must: only entities containing "container", ranked by meaning
+    let must = run(TextMode::Must);
+    assert_eq!(must.len(), 2, "{must:?}");
+    assert!(!must.contains(&"Đường Sắt Hàng Hóa".to_string()));
+    // fuse: semantic-only matches may appear
+    assert!(run(TextMode::Fuse).contains(&"Đường Sắt Hàng Hóa".to_string()));
+
+    // a contract shared by two companies; going there and back must not list the start
+    kb.assert(
+        &ops(serde_json::json!([
+            {"op": "add", "s": "_:c", "p": "rdf:type", "o": "ex:Contract"},
+            {"op": "add", "s": "_:c", "p": "rdfs:label", "o": "HĐ 1"},
+            {"op": "add", "s": ids["ship"], "p": "ex:has_contract", "o": "_:c"},
+            {"op": "add", "s": ids["port"], "p": "ex:has_contract", "o": "_:c"}
+        ])),
+        &opts(),
+    )
+    .unwrap();
+    let partners: Vec<String> = kb
+        .traverse(&ids["ship"], "ex:has_contract/^ex:has_contract", 10)
+        .unwrap()
+        .into_iter()
+        .filter_map(|h| h.label)
+        .collect();
+    assert_eq!(partners, vec!["Cảng Mới"]);
+    // the same, reading the partners' labels: the start's own label must not appear
+    let labels: Vec<String> = kb
+        .traverse(
+            &ids["ship"],
+            "ex:has_contract/^ex:has_contract/rdfs:label",
+            10,
+        )
+        .unwrap()
+        .into_iter()
+        .map(|h| h.iri)
+        .collect();
+    assert_eq!(labels, vec!["\"Cảng Mới\""]);
 }
