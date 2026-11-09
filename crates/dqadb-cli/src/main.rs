@@ -50,7 +50,11 @@ enum Cmd {
         after_help = "Model: embedding.model_dir / DQADB_MODEL_DIR (model.onnx, model.onnx_data, tokenizer.json)\n\
         Runtime: embedding.onnxruntime / DQADB_ORT_LIB (official libonnxruntime.so)"
     )]
-    Embed,
+    Embed {
+        /// Rebuild the HNSW base now (normally done when the delta grows past 10%)
+        #[arg(long)]
+        compact: bool,
+    },
     /// Mint new entity IRIs
     #[command(after_help = "Examples:\n  dqadb new-id\n  dqadb new-id -n 5")]
     NewId {
@@ -501,8 +505,8 @@ fn run(cli: Cli) -> Result<()> {
                 }
             );
         }
-        Cmd::Embed => {
-            let r = kb.embed_sync()?;
+        Cmd::Embed { compact } => {
+            let r = kb.embed(compact)?;
             if json {
                 return print_json(&r);
             }
@@ -515,6 +519,15 @@ fn run(cli: Cli) -> Result<()> {
                 if r.full_rebuild { " (full)" } else { "" },
                 r.seconds
             );
+            if let Some(c) = &r.compaction {
+                match &c.skipped {
+                    Some(why) => println!("vector base: skipped ({why})"),
+                    None => println!(
+                        "vector base: rebuilt with {} vectors in {:.1}s",
+                        c.vectors, c.seconds
+                    ),
+                }
+            }
         }
         Cmd::Rebuild => {
             let r = kb.rebuild()?;

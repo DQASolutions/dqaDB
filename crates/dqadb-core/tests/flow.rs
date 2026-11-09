@@ -640,3 +640,108 @@ fn semantic_search_embeds_lazily_and_reuses_the_cache() {
         Some("Beta")
     );
 }
+
+#[test]
+fn hnsw_base_plus_delta_matches_exact_and_stays_correct() {
+    use dqadb_core::search::SearchQuery;
+    let (dir, kb) = hash_kb();
+    let topics = [
+        "vận tải biển",
+        "cà phê rang xay",
+        "phần mềm kế toán",
+        "xây dựng cầu đường",
+        "bảo hiểm y tế",
+        "dệt may xuất khẩu",
+    ];
+    let mut list = Vec::new();
+    for n in 0..300 {
+        let t = topics[n % topics.len()];
+        list.push(serde_json::json!({"op": "add", "s": format!("_:o{n}"), "p": "rdf:type", "o": "ex:Organization"}));
+        list.push(serde_json::json!({"op": "add", "s": format!("_:o{n}"), "p": "rdfs:label", "o": format!("Org {n} {t}")}));
+    }
+    let res = kb
+        .assert(&ops(serde_json::Value::Array(list)), &opts())
+        .unwrap();
+    let report = kb.embed(true).unwrap();
+    let c = report.compaction.expect("forced compaction");
+    assert!(c.built && c.vectors == 300, "{c:?}");
+    assert!(dir.path().join(".dqadb/vec/base.usearch").exists());
+
+    let sem = |q: &str, k: usize| -> Vec<String> {
+        kb.search(&SearchQuery {
+            semantic: Some(q.into()),
+            limit: k,
+            ..Default::default()
+        })
+        .unwrap()
+        .hits
+        .into_iter()
+        .filter_map(|h| h.label)
+        .collect()
+    };
+    let with_base = sem("bảo hiểm y tế", 10);
+    assert!(
+        with_base.iter().all(|l| l.contains("bảo hiểm y tế")),
+        "{with_base:?}"
+    );
+
+    // same answer as an exact scan (no base)
+    std::fs::rename(
+        dir.path().join(".dqadb/vec/base.json"),
+        dir.path().join("base.json.bak"),
+    )
+    .unwrap();
+    let exact = sem("bảo hiểm y tế", 10);
+    std::fs::rename(
+        dir.path().join("base.json.bak"),
+        dir.path().join(".dqadb/vec/base.json"),
+    )
+    .unwrap();
+    // labels differ only by a number, so scores tie: compare the topic, not the tie order
+    assert!(
+        exact.iter().all(|l| l.contains("bảo hiểm y tế")),
+        "{exact:?}"
+    );
+    assert_eq!(with_base.len(), exact.len());
+
+    // change one entity after the base was built: the base copy is ignored, the delta wins
+    let o0 = res.id_map["_:o0"].replace("urn:dqadb:", "dqadb:");
+    kb.assert(
+        &ops(serde_json::json!([
+            {"op": "retract", "s": o0, "p": "rdfs:label", "o": "Org 0 vận tải biển"},
+            {"op": "add", "s": o0, "p": "rdfs:label", "o": "Org 0 trí tuệ nhân tạo"}
+        ])),
+        &opts(),
+    )
+    .unwrap();
+    // remove the text of another entity entirely
+    let o6 = res.id_map["_:o6"].replace("urn:dqadb:", "dqadb:");
+    kb.assert(
+        &ops(serde_json::json!([
+            {"op": "retract", "s": o6, "p": "rdfs:label", "o": "Org 6 vận tải biển"}
+        ])),
+        &opts(),
+    )
+    .unwrap();
+    let r = kb.embed(false).unwrap();
+    assert!(
+        r.compaction.is_none(),
+        "small delta must not trigger a rebuild"
+    );
+    assert_eq!(sem("trí tuệ nhân tạo", 1), vec!["Org 0 trí tuệ nhân tạo"]);
+    let shipping = sem("vận tải biển", 60);
+    assert!(
+        !shipping
+            .iter()
+            .any(|l| l == "Org 0 vận tải biển" || l == "Org 6 vận tải biển"),
+        "stale vectors returned"
+    );
+
+    // index rebuild = new vector-table generation: the old base is ignored until recompacted
+    kb.rebuild().unwrap();
+    kb.embed(false).unwrap();
+    assert_eq!(sem("trí tuệ nhân tạo", 1), vec!["Org 0 trí tuệ nhân tạo"]);
+    let c = kb.embed(true).unwrap().compaction.unwrap();
+    assert_eq!(c.vectors, 299);
+    assert_eq!(sem("trí tuệ nhân tạo", 1), vec!["Org 0 trí tuệ nhân tạo"]);
+}

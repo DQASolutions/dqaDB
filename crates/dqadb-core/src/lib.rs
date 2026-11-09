@@ -1,6 +1,7 @@
 //! dqaDB core: event files as the source of truth, a rebuildable RDF index on top.
 //! See the spec v0.1 for the design; this crate implements milestone M1.
 
+pub mod ann;
 pub mod config;
 pub mod embed;
 pub mod error;

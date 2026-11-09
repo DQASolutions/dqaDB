@@ -361,7 +361,8 @@ impl Kb {
                     .as_ref()
                     .map(|ids| Arc::new(ids.iter().copied().collect::<HashSet<u64>>()));
                 let (by_text, _) = fts.search(text, candidates, pool, 0)?;
-                let (by_vec, _) = vectors::rank(&r, qv, result.as_deref(), pool)?;
+                let (by_vec, _) =
+                    vectors::rank(&r, &self.index_dir(), qv, result.as_deref(), pool)?;
                 let lists = [
                     by_text.iter().map(|x| x.0).collect(),
                     by_vec.iter().map(|x| x.0).collect(),
@@ -378,7 +379,8 @@ impl Kb {
                 )
             }
             (None, _, Some(qv)) => {
-                let (ranked, total) = vectors::rank(&r, qv, result.as_deref(), window)?;
+                let (ranked, total) =
+                    vectors::rank(&r, &self.index_dir(), qv, result.as_deref(), window)?;
                 (
                     ranked
                         .into_iter()

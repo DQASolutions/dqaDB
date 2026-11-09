@@ -48,7 +48,7 @@ Exit codes: 0 ok · 1 error · 2 validation · 3 not found · 4 ontology not bui
 Done: `init`, `status`, `rebuild`, `verify`, `new-id`, `ontology build|show`, `assert`, `validate`, `retract --event`, `get`, `query` (SPARQL 1.1), `search` (`--text` full-text, `--type`, `--where` filters), `traverse`, `path`, `events show|ls`; RDFS subclass inference.
 Validation enforces the LinkML schema directly (known predicates/classes, ranges, enums, required, single-valued).
 
-Not yet: HNSW base for unfiltered vector search at large scale and `dqadb serve` (resident model), web UI (M3). SHACL: validation runs from LinkML directly; `shapes.ttl` is an export (no runtime SHACL engine until hand-written shapes need one).
+Not yet: `dqadb serve` (resident model + background embedding), `dqadb model install`, web UI (M3). SHACL: validation runs from LinkML directly; `shapes.ttl` is an export (no runtime SHACL engine until hand-written shapes need one).
 
 ## Index store
 
@@ -74,6 +74,8 @@ dqadb search --semantic "ngân hàng" --text "thanh toan" --type ex:Company   # 
 ```
 
 Embeddings: official BAAI bge-m3 ONNX (fp32) on the official ONNX Runtime, loaded dynamically (glibc 2.27+). Each entity's vector is built from `rdfs:label` and its `dqadb_index: vector` literals; vectors live in the SQLite index (f16) and in `emb-cache/<model>.sqlite` (f32, by content hash), so a rebuild never calls the model again. `assert` never embeds; `dqadb embed` catches up by watermark, filling the cache without holding the write lock. Searches report `pending` events not yet embedded.
+
+Vector index: from 20k vectors on, an HNSW base (usearch `=2.26.6`, f16, memory-mapped, `.dqadb/vec/`) covers the vectors up to a change sequence; newer changes are scanned exactly and merged, and entities changed since the base are skipped in it. `dqadb embed` rebuilds the base when the delta exceeds 10% (min 5k), or on `--compact`; the build reads a snapshot through its own connection and renames the file into place, so it never blocks writers or readers. Filtered searches with up to 20k candidates stay exact. Measured at 50k vectors x 1024 dims: 0.04 s per search via the base vs 0.21 s exact (whole CLI call).
 
 ## SPARQL
 

@@ -354,6 +354,10 @@ impl Store {
             if clear {
                 r.conn
                     .execute_batch("DELETE FROM vecs; DELETE FROM vec_dead;")?;
+                // a new generation: any HNSW base built from the old rows is now invalid
+                r.conn
+                    .prepare_cached("INSERT OR REPLACE INTO meta VALUES ('vec_epoch', ?1)")?
+                    .execute([ulid::Ulid::generate().to_string().into_bytes()])?;
             }
             let mut seq = r.meta_u64("vec_seq")?.unwrap_or(0);
             for (id, row) in updates {
@@ -471,6 +475,79 @@ impl Reader<'_> {
     }
 
     /// Visit every stored vector (f16 bytes), in id order.
+    /// Generation of the vector table (changes whenever it is cleared).
+    pub fn vec_epoch(&self) -> Result<Option<String>> {
+        Ok(self
+            .meta("vec_epoch")?
+            .map(|b| String::from_utf8_lossy(&b).into_owned()))
+    }
+
+    /// Highest change sequence number applied to the vector table.
+    pub fn vec_seq(&self) -> Result<u64> {
+        Ok(self.meta_u64("vec_seq")?.unwrap_or(0))
+    }
+
+    /// Visit vectors changed after `seq` (the delta on top of an HNSW base).
+    pub fn vec_since(&self, seq: u64, mut f: impl FnMut(Id, &[u8])) -> Result<()> {
+        let mut st = self
+            .conn
+            .prepare_cached("SELECT id, vec FROM vecs WHERE seq > ?1 ORDER BY id")?;
+        let mut rows = st.query([seq as i64])?;
+        while let Some(row) = rows.next()? {
+            f(
+                row.get::<_, i64>(0)? as Id,
+                row.get_ref(1)?.as_blob().map_err(rusqlite::Error::from)?,
+            );
+        }
+        Ok(())
+    }
+
+    /// Entities whose vector changed or was removed after `seq` (stale in an older base).
+    pub fn vec_changed_since(&self, seq: u64) -> Result<Vec<Id>> {
+        let mut out = Vec::new();
+        for sql in [
+            "SELECT id FROM vecs WHERE seq > ?1",
+            "SELECT id FROM vec_dead WHERE seq > ?1",
+        ] {
+            let mut st = self.conn.prepare_cached(sql)?;
+            let rows = st.query_map([seq as i64], |r| r.get::<_, i64>(0))?;
+            for id in rows {
+                out.push(id? as Id);
+            }
+        }
+        Ok(out)
+    }
+
+    /// Visit vectors with change sequence <= `seq`, in id order, `page` rows at a time
+    /// (used to build an HNSW base without loading everything into memory).
+    pub fn vec_upto_pages(
+        &self,
+        seq: u64,
+        page: usize,
+        mut f: impl FnMut(Vec<(Id, Vec<u8>)>) -> Result<()>,
+    ) -> Result<()> {
+        let mut after: i64 = -1;
+        loop {
+            let mut st = self.conn.prepare_cached(
+                "SELECT id, vec FROM vecs WHERE seq <= ?1 AND id > ?2 ORDER BY id LIMIT ?3",
+            )?;
+            let rows: Vec<(Id, Vec<u8>)> = st
+                .query_map(params![seq as i64, after, page as i64], |r| {
+                    Ok((r.get::<_, i64>(0)? as Id, r.get::<_, Vec<u8>>(1)?))
+                })?
+                .collect::<std::result::Result<_, _>>()?;
+            let Some(last) = rows.last() else {
+                return Ok(());
+            };
+            after = last.0 as i64;
+            let done = rows.len() < page;
+            f(rows)?;
+            if done {
+                return Ok(());
+            }
+        }
+    }
+
     pub fn vec_each(&self, mut f: impl FnMut(Id, &[u8])) -> Result<()> {
         let mut st = self.conn.prepare("SELECT id, vec FROM vecs ORDER BY id")?;
         let mut rows = st.query([])?;

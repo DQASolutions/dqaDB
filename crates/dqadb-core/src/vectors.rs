@@ -27,6 +27,9 @@ const VEC_FORMAT: u32 = 1;
 #[derive(Debug, Default, Serialize)]
 pub struct EmbedReport {
     pub entities_checked: usize,
+    /// HNSW base (re)built after embedding
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub compaction: Option<crate::ann::CompactReport>,
     pub vectors_written: usize,
     pub vectors_removed: usize,
     /// texts sent to the model (cache misses)
@@ -115,6 +118,28 @@ fn touched(
 impl Kb {
     fn cache(&self, model_id: &str) -> Result<Cache> {
         Cache::open(&self.root.join("emb-cache"), model_id)
+    }
+
+    /// Bring the vector projection up to date, then rebuild the HNSW base if the delta
+    /// has grown (or `force_compact`).
+    pub fn embed(&self, force_compact: bool) -> Result<EmbedReport> {
+        let mut report = self.embed_sync()?;
+        let store = self.store_handle()?;
+        let dir = crate::ann::dir(&self.index_dir());
+        let wanted = {
+            let r = store.read()?;
+            let state = r.vec_state()?;
+            (force_compact && r.vec_count()? > 0)
+                || crate::ann::should_build(&dir, &r, state.as_ref())?
+        };
+        if wanted {
+            report.compaction = Some(crate::ann::build(
+                store.path(),
+                &dir,
+                self.config.embedding.dim as usize,
+            )?);
+        }
+        Ok(report)
     }
 
     /// Bring the vector projection up to date with the index (see module docs).
@@ -239,14 +264,25 @@ fn count_misses(cache: &Cache, model_id: &str, texts: &[String]) -> Result<usize
     Ok(n)
 }
 
-/// Exact cosine ranking over stored vectors (restricted to `candidates` when given).
-/// Returns the top `n` and how many vectors were compared.
+/// Cosine ranking. With `candidates` (structured filters) it is exact over those; without,
+/// it uses the HNSW base + delta when one is valid, else an exact scan.
+/// Returns the top `n` and how many vectors were considered.
 pub fn rank(
     r: &Reader,
+    index_dir: &std::path::Path,
     query: &[f32],
     candidates: Option<&[Id]>,
     n: usize,
 ) -> Result<(Vec<(Id, f32)>, usize)> {
+    let large = candidates.is_none_or(|c| c.len() > crate::ann::EXACT_MAX_CANDIDATES);
+    if large {
+        let dir = crate::ann::dir(index_dir);
+        if let Some(meta) = crate::ann::usable(&dir, r, r.vec_state()?.as_ref())? {
+            let allow: Option<std::collections::HashSet<u64>> =
+                candidates.map(|c| c.iter().copied().collect());
+            return crate::ann::search(&dir, &meta, r, query, n, allow.as_ref());
+        }
+    }
     let mut scored: Vec<(Id, f32)> = Vec::new();
     let mut visit =
         |id: Id, blob: &[u8]| scored.push((id, embed::dot(query, &embed::from_f16_bytes(blob))));
