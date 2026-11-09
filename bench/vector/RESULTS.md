@@ -49,6 +49,26 @@ NeurIPS'23 (filtered recall against the filtered ground truth).
 | 50% | **0.979** / 16.8 / 47.8 ms | 0.878 / 23.6 / 30.1 ms | 0.537 / 25.7 / 81.5 ms |
 | 99% | **0.986** / 14.0 / 21.6 ms | 0.860 / 36.1 / 46.0 ms | 0.559 / 40.7 / 132.8 ms |
 
+## Streaming (Big-ANN streaming track / VectorDBBench streaming, scaled)
+
+Sliding window: start with 100k vectors, then 10 steps of +20k new / −10k oldest
+(live set 110k → 200k). Each step: write, then the maintenance each system needs
+(dqaDB `embed`, LanceDB `optimize`), with a reader searching non-stop throughout.
+Recall is against the moving ground truth (brute force over the live set). "Fresh" =
+right after the write, before maintenance.
+
+| | dqaDB | LanceDB IVF_HNSW_SQ |
+|---|---|---|
+| Initial 100k load + index | 65 s | 82 s |
+| Write per step (+20k / −10k) | 4.3–4.8 s (validated events) | 0.2–0.3 s |
+| Maintenance per step | 54 → 94 s (grows: full HNSW rebuild every step) | 16–98 s |
+| Recall@10 settled (mean) | **0.959** (0.955–0.963) | 0.902 (0.860–0.918) |
+| Recall@10 fresh (mean) | 0.815 (new vectors not embedded yet) | **0.927** (new rows scanned exactly) |
+| Hits pointing at deleted vectors | 0 | 0 |
+| Search p50 / p99 settled (200k) | 6.6 / 10.4 ms | 5.9 / 9.9 ms |
+| Search p50 / p99 during write + maintenance | **3–7 / ~100 ms** | 91–137 / ~195 ms |
+| Searches served during a step | 2,300–3,350 | 345–914 |
+
 ## Reading
 
 - Unfiltered: dqaDB and LanceDB HNSW_SQ trace about the same single-thread curve; dqaDB
@@ -56,6 +76,11 @@ NeurIPS'23 (filtered recall against the filtered ground truth).
   446–457 QPS around 0.95–0.97 recall).
 - Filtered: dqaDB keeps recall ≥ 0.979 at every selectivity; LanceDB HNSW_SQ drops to
   0.86–0.88 for loose filters. For tight filters (1–10%) LanceDB is 3× faster at lower recall.
+- Streaming: dqaDB keeps recall ~0.96 as data churns (LanceDB 0.86–0.92) and keeps
+  searches fast while writing (p50 3–7 ms vs ~100 ms). Its weak points: writes are
+  ~15× slower (validation + durable event files), new vectors are invisible until
+  `embed` runs, and every step rebuilds the whole HNSW base because 30k changes exceed
+  the 10% rebuild threshold — maintenance grows with the data.
 - Load: dqaDB indexes faster than IVF_HNSW_SQ, much slower than IVF_PQ; it also writes
   durable, validated event files. Disk is 1.3–1.8× LanceDB, of which 2.1 GB is the
   source of truth and the embedding cache.
@@ -65,7 +90,5 @@ NeurIPS'23 (filtered recall against the filtered ground truth).
 - One run per point (no repetition variance yet); one machine.
 - LanceDB index-build parameters (partitions, sub-vectors) left at defaults; search
   parameters swept. Filtered cases use each system's default search parameters.
-- Not yet covered: the streaming case (search while inserting/deleting, recall against
-  the moving ground truth).
 
 Reproduce: see `README.md` in this directory.
