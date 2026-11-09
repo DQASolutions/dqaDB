@@ -21,9 +21,21 @@ use crate::lock::WriteLock;
 use crate::store::{Id, Reader, Store, VecState};
 use crate::{Error, Result};
 
-/// Filtered searches with more candidates than this use the base (approximate) instead
-/// of an exact scan over the candidates.
-pub const EXACT_MAX_CANDIDATES: usize = 20_000;
+/// Filtered search: an exact scan over the candidates costs ~c, the HNSW base with a
+/// candidate filter ~N/c (sparser filters make it walk more nodes). They cross at
+/// c* = sqrt(K * N); K = 250 was measured at 100k x 1024 (c* ~ 5k; exact won below,
+/// HNSW above, both with the same results). Never below 1k. Env DQADB_EXACT_MAX overrides.
+const CROSSOVER_K: f64 = 250.0;
+
+pub fn exact_max_candidates(total_vectors: u64) -> usize {
+    if let Some(v) = std::env::var("DQADB_EXACT_MAX")
+        .ok()
+        .and_then(|v| v.parse().ok())
+    {
+        return v;
+    }
+    ((CROSSOVER_K * total_vectors as f64).sqrt() as usize).max(1_000)
+}
 
 /// Below this many vectors an exact scan is fast enough; no base is built.
 pub const BASE_MIN_VECTORS: u64 = 20_000;

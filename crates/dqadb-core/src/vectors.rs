@@ -293,7 +293,10 @@ pub fn rank(
     candidates: Option<&[Id]>,
     n: usize,
 ) -> Result<(Vec<(Id, f32)>, usize)> {
-    let large = candidates.is_none_or(|c| c.len() > crate::ann::EXACT_MAX_CANDIDATES);
+    let large = match candidates {
+        None => true,
+        Some(c) => c.len() > crate::ann::exact_max_candidates(r.vec_count()?),
+    };
     if large {
         let dir = crate::ann::dir(index_dir);
         if let Some(meta) = crate::ann::usable(&dir, r, r.vec_state()?.as_ref())? {
