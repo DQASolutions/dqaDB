@@ -2,8 +2,9 @@
 //! scaled to this machine): a sliding window over the dataset. Start with `INITIAL`
 //! vectors, then each step inserts `INSERT` new ones and deletes the `DELETE` oldest.
 //! Per step we report
-//! - write time and maintenance time (whatever the system needs: dqaDB `embed`,
-//!   LanceDB `optimize`),
+//! - write time (until the change is searchable: dqaDB `assert` + vector projection,
+//!   LanceDB `add` + `delete`) and maintenance time (dqaDB HNSW base update, LanceDB
+//!   `optimize`),
 //! - search latency of a reader running *during* the write and maintenance,
 //! - recall@10 right after the write (freshness) and after maintenance, against the
 //!   ground truth of the current live set (moving ground truth, brute force),
@@ -217,9 +218,12 @@ pub fn dqadb(d: &Data, work: &Path) -> StreamReport {
                 }
                 (lat, errs)
             });
+            // write = what makes the change searchable (vectors are precomputed here, as
+            // they are for LanceDB); maintenance = the HNSW base update
             let t = Instant::now();
             dq_insert(&kb, hi, hi + INSERT, &opts);
             dq_delete(&kb, lo, lo + DELETE, &opts);
+            kb.embed_sync().unwrap();
             let write_s = t.elapsed().as_secs_f64();
             let fresh = dq_queries(&kb);
             let t = Instant::now();

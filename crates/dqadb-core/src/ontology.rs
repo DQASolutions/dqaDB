@@ -439,7 +439,7 @@ impl Ontology {
         &self,
         input: &[InputOp],
         mint: &mut dyn FnMut() -> String,
-        existing: &dyn Fn(&str, &str) -> Vec<Term>,
+        existing: &dyn Existing,
     ) -> std::result::Result<Normalized, ValidationReport> {
         let mut report = ValidationReport::default();
         let mut out = Normalized::default();
@@ -704,7 +704,7 @@ impl Ontology {
     fn check_cardinality(
         &self,
         ops: &[Op],
-        existing: &dyn Fn(&str, &str) -> Vec<Term>,
+        existing: &dyn Existing,
         report: &mut ValidationReport,
         warnings: &mut Vec<String>,
     ) {
@@ -727,7 +727,7 @@ impl Ontology {
                 continue;
             }
             let mut finals: BTreeSet<&Term> = values.iter().copied().collect();
-            let current = existing(s, p);
+            let current = existing.values(s, p);
             for v in &current {
                 if !retracts.contains(&(*s, *p, v)) {
                     finals.insert(v);
@@ -767,7 +767,7 @@ impl Ontology {
                             continue;
                         }
                         let in_event = adds.contains_key(&(s, slot_iri.as_str()));
-                        if !in_event && existing(s, slot_iri).is_empty() {
+                        if !in_event && existing.values(s, slot_iri).is_empty() {
                             report.push(
                                 self.compact(s),
                                 format!("{} requires {}", c.name, self.compact(slot_iri)),
@@ -784,7 +784,7 @@ impl Ontology {
         }
 
         for op in ops {
-            if op.op == OpKind::Retract && !existing(&op.s, &op.p).contains(&op.o) {
+            if op.op == OpKind::Retract && !existing.has(&op.s, &op.p, &op.o) {
                 warnings.push(format!(
                     "retract of a triple that is not stored: {} {} {}",
                     self.compact(&op.s),
@@ -793,6 +793,22 @@ impl Ontology {
                 ));
             }
         }
+    }
+}
+
+/// What is stored now, as seen by validation.
+pub trait Existing {
+    /// Current values of (s, p).
+    fn values(&self, s: &str, p: &str) -> Vec<Term>;
+    /// Whether (s, p, o) is stored.
+    fn has(&self, s: &str, p: &str, o: &Term) -> bool {
+        self.values(s, p).contains(o)
+    }
+}
+
+impl<F: Fn(&str, &str) -> Vec<Term>> Existing for F {
+    fn values(&self, s: &str, p: &str) -> Vec<Term> {
+        self(s, p)
     }
 }
 

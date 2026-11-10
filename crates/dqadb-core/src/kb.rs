@@ -456,9 +456,8 @@ impl Kb {
         let batch = store.batch(&inference)?;
         let base = self.config.base_iri.clone();
         let mut mint = || format!("{base}{}", Ulid::generate());
-        let existing = |s: &str, p: &str| batch.values(s, p).unwrap_or_default();
         let norm = onto
-            .normalize(input, &mut mint, &existing)
+            .normalize(input, &mut mint, &batch)
             .map_err(Error::Validation)?;
         self.commit(
             &store,

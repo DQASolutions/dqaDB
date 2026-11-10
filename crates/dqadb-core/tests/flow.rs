@@ -645,6 +645,10 @@ fn semantic_search_embeds_lazily_and_reuses_the_cache() {
 #[test]
 fn hnsw_base_plus_delta_matches_exact_and_stays_correct() {
     use dqadb_core::search::SearchQuery;
+    // hash-test labels differ by one number, so vectors are near-duplicates and HNSW
+    // (incremental or rebuilt) misses a few of them: the exact checks are about stale and
+    // deleted vectors; recall checks allow a small loss (real-data recall: bench/vector)
+    unsafe { std::env::set_var("DQADB_HNSW_EF", "1024") };
     let (dir, kb) = hash_kb();
     let topics = [
         "vận tải biển",
@@ -738,12 +742,99 @@ fn hnsw_base_plus_delta_matches_exact_and_stays_correct() {
         "stale vectors returned"
     );
 
+    // incremental update of the base: same answers, no stale vectors, delta now empty
+    let c = dqadb_core::ann::build(
+        &dir.path().join(".dqadb/index.sqlite"),
+        &dir.path().join(".dqadb/vec"),
+        64,
+        false,
+    )
+    .unwrap();
+    assert!(c.built && c.incremental && c.vectors == 299, "{c:?}");
+    let meta = dqadb_core::ann::load_meta(&dir.path().join(".dqadb/vec")).unwrap();
+    assert_eq!(meta.churn, 2);
+    assert_eq!(sem("trí tuệ nhân tạo", 1), vec!["Org 0 trí tuệ nhân tạo"]);
+    let shipping = sem("vận tải biển", 60);
+    // approximate: allow a few misses on near-duplicates
+    let found = shipping
+        .iter()
+        .filter(|l| l.contains("vận tải biển"))
+        .count();
+    assert!(found >= 44, "{found}: {shipping:?}");
+    assert!(
+        !shipping
+            .iter()
+            .any(|l| l == "Org 0 vận tải biển" || l == "Org 6 vận tải biển"),
+        "stale vectors returned after incremental update"
+    );
+    // remove a third of the entities, re-add some as new ones: incremental again
+    let mut list = Vec::new();
+    for n in (1..300).filter(|n| n % 3 == 0 && *n != 6) {
+        let t = topics[n % topics.len()];
+        let s = res.id_map[&format!("_:o{n}")].replace("urn:dqadb:", "dqadb:");
+        list.push(serde_json::json!({"op": "retract", "s": s, "p": "rdfs:label", "o": format!("Org {n} {t}")}));
+    }
+    for n in 300..340 {
+        list.push(serde_json::json!({"op": "add", "s": format!("_:o{n}"), "p": "rdf:type", "o": "ex:Organization"}));
+        list.push(serde_json::json!({"op": "add", "s": format!("_:o{n}"), "p": "rdfs:label", "o": format!("Org {n} năng lượng mặt trời")}));
+    }
+    kb.assert(&ops(serde_json::Value::Array(list)), &opts())
+        .unwrap();
+    kb.embed_sync().unwrap();
+    let before = sem("năng lượng mặt trời", 40);
+    let c = dqadb_core::ann::build(
+        &dir.path().join(".dqadb/index.sqlite"),
+        &dir.path().join(".dqadb/vec"),
+        64,
+        false,
+    )
+    .unwrap();
+    assert!(c.incremental && c.vectors == 299 - 98 + 40, "{c:?}");
+    // these 40 vectors are near-identical, the worst case for HNSW: check most are found
+    let after = sem("năng lượng mặt trời", 40);
+    let solar = after
+        .iter()
+        .filter(|l| l.contains("năng lượng mặt trời"))
+        .count();
+    assert!(solar >= 24, "{solar}: {after:?}");
+    // nothing deleted comes back
+    let all = sem("vận tải biển", 300);
+    for n in (1..300).filter(|n| n % 3 == 0) {
+        let t = topics[n % topics.len()];
+        assert!(
+            !all.contains(&format!("Org {n} {t}")),
+            "deleted Org {n} returned"
+        );
+    }
+    assert!(
+        before.iter().all(|l| l.contains("năng lượng mặt trời")),
+        "{before:?}"
+    );
+    // churn now above 25%: the next update is a full rebuild
+    kb.assert(
+        &ops(
+            serde_json::json!([{"op": "add", "s": "_:z", "p": "rdf:type", "o": "ex:Organization"},
+                                {"op": "add", "s": "_:z", "p": "rdfs:label", "o": "Z"}]),
+        ),
+        &opts(),
+    )
+    .unwrap();
+    kb.embed_sync().unwrap();
+    let c = dqadb_core::ann::build(
+        &dir.path().join(".dqadb/index.sqlite"),
+        &dir.path().join(".dqadb/vec"),
+        64,
+        false,
+    )
+    .unwrap();
+    assert!(c.built && !c.incremental && c.vectors == 242, "{c:?}");
+
     // index rebuild = new vector-table generation: the old base is ignored until recompacted
     kb.rebuild().unwrap();
     kb.embed(false).unwrap();
     assert_eq!(sem("trí tuệ nhân tạo", 1), vec!["Org 0 trí tuệ nhân tạo"]);
     let c = kb.embed(true).unwrap().compaction.unwrap();
-    assert_eq!(c.vectors, 299);
+    assert_eq!(c.vectors, 242);
     assert_eq!(sem("trí tuệ nhân tạo", 1), vec!["Org 0 trí tuệ nhân tạo"]);
 }
 

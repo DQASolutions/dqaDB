@@ -60,14 +60,25 @@ right after the write, before maintenance.
 | | dqaDB | LanceDB IVF_HNSW_SQ |
 |---|---|---|
 | Initial 100k load + index | 65 s | 82 s |
-| Write per step (+20k / −10k) | 4.3–4.8 s (validated events) | 0.2–0.3 s |
-| Maintenance per step | 54 → 94 s (grows: full HNSW rebuild every step) | 16–98 s |
-| Recall@10 settled (mean) | **0.959** (0.955–0.963) | 0.902 (0.860–0.918) |
-| Recall@10 fresh (mean) | 0.815 (new vectors not embedded yet) | **0.927** (new rows scanned exactly) |
+| Write per step until searchable (+20k / −10k) | 6–8 s typical, spikes 24 / 55 s (validated events + vector projection) | 0.2–0.3 s |
+| Maintenance per step | 10–17 s (incremental HNSW update); 128 s once (full rebuild at 25% tombstones) | 16–98 s |
+| Recall@10 settled (mean) | **0.964** (0.962–0.968, no downward trend) | 0.902 (0.860–0.918) |
+| Recall@10 fresh, right after write (mean) | **0.971** | 0.927 |
 | Hits pointing at deleted vectors | 0 | 0 |
-| Search p50 / p99 settled (200k) | 6.6 / 10.4 ms | 5.9 / 9.9 ms |
-| Search p50 / p99 during write + maintenance | **3–7 / ~100 ms** | 91–137 / ~195 ms |
-| Searches served during a step | 2,300–3,350 | 345–914 |
+| Search p50 / p99 settled (200k) | 7.1 / 11.2 ms | 5.9 / 9.9 ms |
+| Search p50 / p99 during write + maintenance | **3–9 / 94–173 ms** | 91–137 / ~195 ms |
+
+Index maintenance follows the published "logical deletion + periodic rebuild" scheme
+(Yamashita et al., NeurIPS'25 workshop; also what Qdrant does inside a segment):
+changed vectors are tombstoned in the HNSW graph (kept for routing, never returned),
+new ones are added to a copy of the base, and the base is rebuilt once tombstones pass
+25%. History of this design, measured on this benchmark:
+
+| Variant | Settled recall over 10 steps | Maintenance per step |
+|---|---|---|
+| Full rebuild every time the delta passes 10% | 0.955–0.963 | 54 → 94 s (grows with data) |
+| Incremental, physical removal (usearch reuses freed slots) | 0.954 → 0.935 (declining) | 10–16 s |
+| **Incremental, tombstones + rebuild at 25%** (current) | **0.962–0.968 (stable)** | 10–17 s |
 
 ## Reading
 
@@ -76,11 +87,10 @@ right after the write, before maintenance.
   446–457 QPS around 0.95–0.97 recall).
 - Filtered: dqaDB keeps recall ≥ 0.979 at every selectivity; LanceDB HNSW_SQ drops to
   0.86–0.88 for loose filters. For tight filters (1–10%) LanceDB is 3× faster at lower recall.
-- Streaming: dqaDB keeps recall ~0.96 as data churns (LanceDB 0.86–0.92) and keeps
-  searches fast while writing (p50 3–7 ms vs ~100 ms). Its weak points: writes are
-  ~15× slower (validation + durable event files), new vectors are invisible until
-  `embed` runs, and every step rebuilds the whole HNSW base because 30k changes exceed
-  the 10% rebuild threshold — maintenance grows with the data.
+- Streaming: dqaDB keeps recall 0.96–0.97 as data churns (LanceDB 0.86–0.92), both
+  fresh and settled, and keeps searches fast while writing (p50 3–9 ms vs ~100 ms).
+  Its weak point: writes are ~25× slower than LanceDB's appends (validation, durable
+  event files, graph index), with occasional unexplained spikes.
 - Load: dqaDB indexes faster than IVF_HNSW_SQ, much slower than IVF_PQ; it also writes
   durable, validated event files. Disk is 1.3–1.8× LanceDB, of which 2.1 GB is the
   source of truth and the embedding cache.

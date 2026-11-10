@@ -74,6 +74,12 @@ fn entity_text(r: &Reader, s: Id, pred_ids: &[Id]) -> Result<String> {
     Ok(parts.join("\n"))
 }
 
+fn keyed_texts(r: &Reader, ids: &BTreeSet<Id>, pids: &[Id]) -> Result<Vec<(Id, String)>> {
+    ids.iter()
+        .map(|s| Ok((*s, entity_text(r, *s, pids)?)))
+        .collect()
+}
+
 fn pred_ids(r: &Reader, preds: &[String]) -> Result<Vec<Id>> {
     let mut out = Vec::new();
     for p in preds {
@@ -137,6 +143,7 @@ impl Kb {
                 store.path(),
                 &dir,
                 self.config.embedding.dim as usize,
+                force_compact,
             )?);
         }
         Ok(report)
@@ -156,25 +163,25 @@ impl Kb {
         let store = self.store_handle()?;
         let mut report = EmbedReport::default();
 
-        // phase 1: no lock, fill the cache (slow)
-        {
+        // phase 1: no lock, compute texts and fill the cache (slow with a real model)
+        let snapshot = {
             let r = store.read()?;
-            let state = r.vec_state()?;
-            let (ids, _) = touched(self, &r, &preds, state.as_ref(), &config, r.watermark()?)?;
+            let (wm, state) = (r.watermark()?, r.vec_state()?);
+            let (ids, full) = touched(self, &r, &preds, state.as_ref(), &config, wm)?;
             let pids = pred_ids(&r, &preds)?;
-            let texts: Vec<String> = ids
-                .iter()
-                .map(|s| entity_text(&r, *s, &pids))
-                .collect::<Result<Vec<_>>>()?
-                .into_iter()
-                .filter(|t| !t.is_empty())
-                .collect();
+            let keyed = keyed_texts(&r, &ids, &pids)?;
             drop(r);
-            report.model_calls += count_misses(&cache, &model_id, &texts)?;
-            embed::embed_cached(&mut cache, model, &texts, batch)?;
-        }
+            let texts: Vec<String> = keyed
+                .iter()
+                .filter(|(_, t)| !t.is_empty())
+                .map(|(_, t)| t.clone())
+                .collect();
+            let (vecs, misses) = embed::embed_cached_counted(&mut cache, model, &texts, batch)?;
+            report.model_calls += misses;
+            (wm, state, full, keyed, vecs)
+        };
 
-        // phase 2: write lock, catch up and store (fast: nearly everything is cached)
+        // phase 2: write lock, catch up and store
         let _lock = self.lock()?;
         let inference = onto.inference();
         self.sync_locked(&store, &inference)?;
@@ -189,21 +196,24 @@ impl Kb {
             report.seconds = started.elapsed().as_secs_f64();
             return Ok(report);
         }
-        let (ids, full) = touched(self, &r, &preds, state.as_ref(), &config, wm)?;
+        // nothing changed since phase 1 (the usual case): reuse its texts and vectors
+        let (full, keyed, vecs) = if snapshot.0 == wm && snapshot.1 == state {
+            (snapshot.2, snapshot.3, snapshot.4)
+        } else {
+            let (ids, full) = touched(self, &r, &preds, state.as_ref(), &config, wm)?;
+            let pids = pred_ids(&r, &preds)?;
+            let keyed = keyed_texts(&r, &ids, &pids)?;
+            let texts: Vec<String> = keyed
+                .iter()
+                .filter(|(_, t)| !t.is_empty())
+                .map(|(_, t)| t.clone())
+                .collect();
+            let (vecs, misses) = embed::embed_cached_counted(&mut cache, model, &texts, batch)?;
+            report.model_calls += misses;
+            (full, keyed, vecs)
+        };
         report.full_rebuild = full;
-        report.entities_checked = ids.len();
-        let pids = pred_ids(&r, &preds)?;
-        let mut texts = Vec::new();
-        let mut keyed = Vec::new();
-        for s in &ids {
-            let text = entity_text(&r, *s, &pids)?;
-            keyed.push((*s, text.clone()));
-            if !text.is_empty() {
-                texts.push(text);
-            }
-        }
-        report.model_calls += count_misses(&cache, &model_id, &texts)?;
-        let vecs = embed::embed_cached(&mut cache, model, &texts, batch)?;
+        report.entities_checked = keyed.len();
         let mut vecs = vecs.into_iter();
         let mut updates: Vec<(Id, Option<VecRow>)> = Vec::new();
         for (s, text) in keyed {
@@ -276,16 +286,6 @@ impl Kb {
     pub fn embedder_status(&self) -> (String, bool) {
         (self.embedder.id(), self.embedder.loaded())
     }
-}
-
-fn count_misses(cache: &Cache, model_id: &str, texts: &[String]) -> Result<usize> {
-    let mut n = 0;
-    for t in texts {
-        if cache.get(&embed::text_key(model_id, t))?.is_none() {
-            n += 1;
-        }
-    }
-    Ok(n)
 }
 
 /// Cosine ranking. With `candidates` (structured filters) it is exact over those; without,

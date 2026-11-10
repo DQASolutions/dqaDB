@@ -2,9 +2,16 @@
 //! vectors up to some change sequence, plus an exact scan of the "delta" changed since.
 //! (Spec §8/§11, decision 2026-11-09.)
 //!
-//! - The base is immutable; readers memory-map it. Building a new one never blocks writers
-//!   or readers: it reads a snapshot through its own connection, writes a temp file, and
-//!   renames it into place (processes still using the old file keep their mapping).
+//! - Each base file is immutable; readers memory-map it. Producing a new one never blocks
+//!   writers or readers: it reads a snapshot through its own connection, writes a temp
+//!   file, and renames it into place (processes still using the old file keep their
+//!   mapping).
+//! - A new base is normally made incrementally: load the current one, retire the nodes
+//!   of entities changed since, add their new vectors. A retired node is not removed
+//!   (usearch would reuse its slot and cut the paths through it, losing recall): its key
+//!   moves to the tombstone range (>= 2^63), so it still routes searches but is never
+//!   returned. Once tombstones exceed `FULL_REBUILD_CHURN` of the base, or on
+//!   `--compact`, the base is rebuilt from scratch.
 //! - `base.json` records the vector-table generation (`epoch`) and the sequence the base
 //!   covers. If the table was cleared since (config change, index rebuild), the base is
 //!   ignored and search falls back to an exact scan until the next compaction.
@@ -54,7 +61,16 @@ pub struct BaseMeta {
     /// vector encoding inside the HNSW file: "f16" or "i8"
     #[serde(default = "f16_name")]
     pub quant: String,
+    /// tombstoned nodes (retired by incremental updates since the last full build)
+    #[serde(default)]
+    pub churn: usize,
 }
+
+/// Keys at or above this are tombstones (entity ids never get this large).
+const TOMBSTONE: u64 = 1 << 63;
+
+/// Rebuild from scratch once incremental removals exceed this share of the base.
+const FULL_REBUILD_CHURN: f64 = 0.25;
 
 fn f16_name() -> String {
     "f16".into()
@@ -84,6 +100,8 @@ fn scalar(quant: &str) -> ScalarKind {
 #[derive(Debug, Default, Serialize)]
 pub struct CompactReport {
     pub built: bool,
+    /// updated from the previous base rather than rebuilt from scratch
+    pub incremental: bool,
     pub vectors: usize,
     pub seconds: f64,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -169,14 +187,68 @@ pub fn should_build(dir: &Path, r: &Reader, state: Option<&VecState>) -> Result<
     Ok(match usable(dir, r, state)? {
         None => true,
         Some(meta) => {
+            // incremental updates cost about the delta, so they can run often
             let delta = r.vec_changed_since(meta.seq)?.len() as u64;
-            delta > (meta.count as u64 / 10).max(5_000)
+            delta > (meta.count as u64 / 20).max(2_000)
         }
     })
 }
 
-/// Build a new base from a snapshot of `store_path` (own connection, own lock).
-pub fn build(store_path: &Path, dir: &Path, dim: usize) -> Result<CompactReport> {
+/// Add vectors from all cores.
+fn add_parallel(index: &Index, decoded: &[(Id, Vec<f32>)]) -> Result<()> {
+    let threads = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4);
+    std::thread::scope(|s| -> Result<()> {
+        let handles: Vec<_> = (0..threads)
+            .map(|t| {
+                s.spawn(move || -> Result<()> {
+                    for (id, v) in decoded.iter().skip(t).step_by(threads) {
+                        index.add(*id, v).map_err(ann_err)?;
+                    }
+                    Ok(())
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join()
+                .map_err(|_| Error::other("vector index build thread panicked"))??;
+        }
+        Ok(())
+    })
+}
+
+fn decode(rows: Vec<(Id, Vec<u8>)>, dim: usize) -> Result<Vec<(Id, Vec<f32>)>> {
+    let decoded: Vec<(Id, Vec<f32>)> = rows
+        .into_iter()
+        .map(|(id, b)| (id, embed::from_f16_bytes(&b)))
+        .collect();
+    if decoded.iter().any(|(_, v)| v.len() != dim) {
+        return Err(Error::other(format!(
+            "stored vectors do not have {dim} dimensions"
+        )));
+    }
+    Ok(decoded)
+}
+
+/// Write `index` and its metadata into place (temp file + rename each).
+fn install(dir: &Path, index: &Index, meta: &BaseMeta) -> Result<()> {
+    let (file, meta_path) = files(dir);
+    let tmp = dir.join("base.usearch.tmp");
+    index
+        .save(tmp.to_str().ok_or_else(|| ann_err("non-UTF-8 path"))?)
+        .map_err(ann_err)?;
+    std::fs::rename(&tmp, &file)?;
+    let tmp_meta = dir.join("base.json.tmp");
+    std::fs::write(&tmp_meta, serde_json::to_vec_pretty(meta)?)?;
+    std::fs::rename(&tmp_meta, &meta_path)?;
+    Ok(())
+}
+
+/// Bring the base up to date from a snapshot of `store_path` (own connection, own
+/// lock): incrementally when the current base allows it, else (or with `full`) from
+/// scratch.
+pub fn build(store_path: &Path, dir: &Path, dim: usize, full: bool) -> Result<CompactReport> {
     let started = Instant::now();
     std::fs::create_dir_all(dir)?;
     let _lock = match WriteLock::acquire(&dir.join(".compact.lock"), Duration::ZERO) {
@@ -198,52 +270,70 @@ pub fn build(store_path: &Path, dir: &Path, dim: usize) -> Result<CompactReport>
         });
     };
     let seq = r.vec_seq()?;
+
+    // incremental: current base minus what changed, plus the new vectors
+    if let Some(old) = usable(dir, &r, Some(&state))?.filter(|m| {
+        !full && m.dim == dim && (m.churn as f64) < FULL_REBUILD_CHURN * m.count.max(1) as f64
+    }) {
+        let mut changed = r.vec_changed_since(old.seq)?;
+        changed.sort_unstable();
+        changed.dedup();
+        if changed.is_empty() && old.seq == seq {
+            return Ok(CompactReport {
+                skipped: Some("vector base is up to date".into()),
+                ..Default::default()
+            });
+        }
+        let mut rows = Vec::new();
+        r.vec_of(&changed, |id, b| rows.push((id, b.to_vec())))?;
+        drop(r);
+        let fresh = decode(rows, dim)?;
+        let (file, _) = files(dir);
+        let index = Index::new(&options(dim, &old.quant)).map_err(ann_err)?;
+        index
+            .load(file.to_str().ok_or_else(|| ann_err("non-UTF-8 path"))?)
+            .map_err(ann_err)?;
+        let mut removed = 0usize;
+        for id in &changed {
+            if index.contains(*id) {
+                let tomb = TOMBSTONE + (old.churn + removed) as u64;
+                index.rename(*id, tomb).map_err(ann_err)?;
+                removed += 1;
+            }
+        }
+        index.reserve(index.size() + fresh.len()).map_err(ann_err)?;
+        add_parallel(&index, &fresh)?;
+        let meta = BaseMeta {
+            epoch,
+            seq,
+            config: state.config,
+            count: old.count + fresh.len() - removed,
+            dim,
+            quant: old.quant,
+            churn: old.churn + removed,
+        };
+        install(dir, &index, &meta)?;
+        return Ok(CompactReport {
+            built: true,
+            incremental: true,
+            vectors: meta.count,
+            seconds: started.elapsed().as_secs_f64(),
+            skipped: None,
+        });
+    }
+
     let count = r.vec_count()? as usize;
     let quant = base_quant();
     let index = Index::new(&options(dim, &quant)).map_err(ann_err)?;
     index.reserve(count.max(1)).map_err(ann_err)?;
-    let threads = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(4);
     let mut added = 0usize;
     r.vec_upto_pages(seq, BUILD_PAGE, |rows| {
-        let decoded: Vec<(Id, Vec<f32>)> = rows
-            .into_iter()
-            .map(|(id, b)| (id, embed::from_f16_bytes(&b)))
-            .collect();
-        if decoded.iter().any(|(_, v)| v.len() != dim) {
-            return Err(Error::other(format!(
-                "stored vectors do not have {dim} dimensions"
-            )));
-        }
-        std::thread::scope(|s| -> Result<()> {
-            let handles: Vec<_> = (0..threads)
-                .map(|t| {
-                    let (index, decoded) = (&index, &decoded);
-                    s.spawn(move || -> Result<()> {
-                        for (id, v) in decoded.iter().skip(t).step_by(threads) {
-                            index.add(*id, v).map_err(ann_err)?;
-                        }
-                        Ok(())
-                    })
-                })
-                .collect();
-            for h in handles {
-                h.join()
-                    .map_err(|_| Error::other("vector index build thread panicked"))??;
-            }
-            Ok(())
-        })?;
+        let decoded = decode(rows, dim)?;
+        add_parallel(&index, &decoded)?;
         added += decoded.len();
         Ok(())
     })?;
     drop(r);
-    let (file, meta_path) = files(dir);
-    let tmp = dir.join("base.usearch.tmp");
-    index
-        .save(tmp.to_str().ok_or_else(|| ann_err("non-UTF-8 path"))?)
-        .map_err(ann_err)?;
-    std::fs::rename(&tmp, &file)?;
     let meta = BaseMeta {
         epoch,
         seq,
@@ -251,12 +341,12 @@ pub fn build(store_path: &Path, dir: &Path, dim: usize) -> Result<CompactReport>
         count: added,
         dim,
         quant,
+        churn: 0,
     };
-    let tmp_meta = dir.join("base.json.tmp");
-    std::fs::write(&tmp_meta, serde_json::to_vec_pretty(&meta)?)?;
-    std::fs::rename(&tmp_meta, &meta_path)?;
+    install(dir, &index, &meta)?;
     Ok(CompactReport {
         built: true,
+        incremental: false,
         vectors: added,
         seconds: started.elapsed().as_secs_f64(),
         skipped: None,
@@ -290,10 +380,11 @@ pub fn search(
     } else {
         n
     };
-    let found = match (stale.is_empty(), allow) {
+    let tombs = meta.churn > 0;
+    let found = match (stale.is_empty() && !tombs, allow) {
         (true, None) => index.search(query, pool).map_err(ann_err)?,
         (_, None) => index
-            .filtered_search(query, pool, |k| !stale.contains(&k))
+            .filtered_search(query, pool, |k| k < TOMBSTONE && !stale.contains(&k))
             .map_err(ann_err)?,
         (_, Some(a)) => index
             .filtered_search(query, pool, |k| a.contains(&k) && !stale.contains(&k))

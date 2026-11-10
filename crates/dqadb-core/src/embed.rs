@@ -376,32 +376,55 @@ impl LazyEmbedder {
 }
 
 /// Embed `texts`, calling the model only for cache misses, in batches.
+/// Vectors written to the cache per transaction.
+const CACHE_FLUSH: usize = 1024;
+
 pub fn embed_cached(
     cache: &mut Cache,
     model: &LazyEmbedder,
     texts: &[String],
     batch: usize,
 ) -> Result<Vec<Vec<f32>>> {
+    Ok(embed_cached_counted(cache, model, texts, batch)?.0)
+}
+
+/// Like `embed_cached`, also returning how many texts were sent to the model.
+pub fn embed_cached_counted(
+    cache: &mut Cache,
+    model: &LazyEmbedder,
+    texts: &[String],
+    batch: usize,
+) -> Result<(Vec<Vec<f32>>, usize)> {
     let id = model.id();
     let keys: Vec<[u8; 32]> = texts.iter().map(|t| text_key(&id, t)).collect();
     let mut out: Vec<Option<Vec<f32>>> =
         keys.iter().map(|k| cache.get(k)).collect::<Result<_>>()?;
     let missing: Vec<usize> = (0..texts.len()).filter(|i| out[*i].is_none()).collect();
+    // one cache transaction per CACHE_FLUSH vectors, not per model batch: a fast model
+    // (remote endpoint, GPU, precomputed) would otherwise wait on commits
+    let mut pending: Vec<([u8; 32], Vec<f32>)> = Vec::new();
+    let mut last_flush = std::time::Instant::now();
     for chunk in missing.chunks(batch.max(1)) {
         let batch_texts: Vec<String> = chunk.iter().map(|i| texts[*i].clone()).collect();
         let vecs = model.get()?.embed(&batch_texts)?;
-        cache.put_many(
-            &chunk
-                .iter()
-                .zip(&vecs)
-                .map(|(i, v)| (keys[*i], v.clone()))
-                .collect::<Vec<_>>(),
-        )?;
         for (i, v) in chunk.iter().zip(vecs) {
+            pending.push((keys[*i], v.clone()));
             out[*i] = Some(v);
         }
+        // a slow model still saves progress every few seconds
+        if pending.len() >= CACHE_FLUSH || last_flush.elapsed().as_secs() >= 5 {
+            cache.put_many(&pending)?;
+            pending.clear();
+            last_flush = std::time::Instant::now();
+        }
     }
-    Ok(out.into_iter().map(|v| v.expect("filled")).collect())
+    if !pending.is_empty() {
+        cache.put_many(&pending)?;
+    }
+    Ok((
+        out.into_iter().map(|v| v.expect("filled")).collect(),
+        missing.len(),
+    ))
 }
 
 /// f32 -> f16 bytes (index storage) and back.

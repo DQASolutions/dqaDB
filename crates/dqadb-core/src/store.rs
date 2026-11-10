@@ -17,7 +17,7 @@
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeSet, VecDeque};
+use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard};
 use std::time::Duration;
@@ -318,6 +318,7 @@ impl Store {
         let stale = r.inference_hash()?.as_deref() != Some(inference.hash.as_str());
         let mut batch = Batch {
             r: Some(r),
+            term_ids: Default::default(),
             next_id,
             counts,
             watermark,
@@ -841,10 +842,21 @@ impl Iterator for Scan<'_, '_> {
 /// One write transaction applying events in ULID order. Rolled back unless committed.
 pub struct Batch<'a> {
     r: Option<Reader<'a>>,
+    /// term ids seen in this batch (predicates and classes repeat on every entity)
+    term_ids: std::cell::RefCell<HashMap<Term, Id>>,
     next_id: Id,
     counts: Counts,
     watermark: Option<Ulid>,
     inference: &'a Inference,
+}
+
+impl crate::ontology::Existing for Batch<'_> {
+    fn values(&self, s: &str, p: &str) -> Vec<Term> {
+        Batch::values(self, s, p).unwrap_or_default()
+    }
+    fn has(&self, s: &str, p: &str, o: &Term) -> bool {
+        Batch::has(self, s, p, o).unwrap_or(false)
+    }
 }
 
 impl<'a> Batch<'a> {
@@ -856,8 +868,28 @@ impl<'a> Batch<'a> {
         Ok(self.r().conn.prepare_cached(sql)?.execute(args)?)
     }
 
+    /// Id of a term already in the index (cached for the batch).
+    fn known_id(&self, t: &Term) -> Result<Option<Id>> {
+        if let Some(id) = self.term_ids.borrow().get(t) {
+            return Ok(Some(*id));
+        }
+        let id = self.r().term_id(t)?;
+        if let Some(id) = id {
+            self.remember(t, id);
+        }
+        Ok(id)
+    }
+
+    fn remember(&self, t: &Term, id: Id) {
+        let mut cache = self.term_ids.borrow_mut();
+        if cache.len() > 1_000_000 {
+            cache.clear();
+        }
+        cache.insert(t.clone(), id);
+    }
+
     fn id_for(&mut self, t: &Term) -> Result<Id> {
-        if let Some(id) = self.r().term_id(t)? {
+        if let Some(id) = self.known_id(t)? {
             return Ok(id);
         }
         let id = self.next_id;
@@ -867,17 +899,32 @@ impl<'a> Batch<'a> {
             params![i(id), &term_hash(t)[..], serde_json::to_string(t)?],
         )?;
         self.counts.terms += 1;
+        self.remember(t, id);
         Ok(id)
     }
 
     fn put_triple(&mut self, s: Id, p: Id, o: Id) -> Result<()> {
+        self.put_triple_term(s, p, o, None).map(|_| ())
+    }
+
+    /// `o_term`: the object's term when the caller has it (saves a lookup).
+    /// Returns whether the triple was new.
+    fn put_triple_term(&mut self, s: Id, p: Id, o: Id, o_term: Option<&Term>) -> Result<bool> {
         if self.exec(
             "INSERT OR IGNORE INTO spo VALUES (?1, ?2, ?3)",
             params![i(s), i(p), i(o)],
         )? == 1
         {
-            if let Term::Literal(l) = self.r().term(o)? {
-                let (num, txt) = literal_key(&l);
+            let owned;
+            let term = match o_term {
+                Some(t) => t,
+                None => {
+                    owned = self.r().term(o)?;
+                    &owned
+                }
+            };
+            if let Term::Literal(l) = term {
+                let (num, txt) = literal_key(l);
                 self.exec(
                     "INSERT INTO props VALUES (?1, ?2, ?3, ?4, ?5)",
                     params![i(p), i(s), i(o), num, txt],
@@ -892,8 +939,9 @@ impl<'a> Batch<'a> {
                 params![i(o), i(s), i(p)],
             )?;
             self.counts.triples += 1;
+            return Ok(true);
         }
-        Ok(())
+        Ok(false)
     }
 
     fn delete_triple(&mut self, s: Id, p: Id, o: Id) -> Result<()> {
@@ -938,12 +986,12 @@ impl<'a> Batch<'a> {
                         self.id_for(&p_term)?,
                         self.id_for(&op.o)?,
                     );
-                    if self.r().has_prov(s, p, o)? {
+                    // an asserted triple is always in spo, so a new spo row means new
+                    if !self.put_triple_term(s, p, o, Some(&op.o))? && self.r().has_prov(s, p, o)? {
                         stats.noop += 1;
                     } else {
                         stats.added += 1;
                     }
-                    self.put_triple(s, p, o)?;
                     self.exec(
                         "INSERT OR IGNORE INTO prov VALUES (?1, ?2, ?3, ?4)",
                         params![i(s), i(p), i(o), &ulid_blob(eid)[..]],
@@ -954,9 +1002,9 @@ impl<'a> Batch<'a> {
                 }
                 OpKind::Retract => {
                     let ids = (
-                        self.r().term_id(&s_term)?,
-                        self.r().term_id(&p_term)?,
-                        self.r().term_id(&op.o)?,
+                        self.known_id(&s_term)?,
+                        self.known_id(&p_term)?,
+                        self.known_id(&op.o)?,
                     );
                     let (Some(s), Some(p), Some(o)) = ids else {
                         stats.noop += 1;
@@ -1056,8 +1104,27 @@ impl<'a> Batch<'a> {
     }
 
     /// Current values of (s, p), including changes applied earlier in this batch.
+    /// Whether (s, p, o) is stored (cached term lookups, no term decoding).
+    pub fn has(&self, s: &str, p: &str, o: &Term) -> Result<bool> {
+        let (Some(s), Some(p), Some(o)) = (
+            self.known_id(&Term::Iri(s.into()))?,
+            self.known_id(&Term::Iri(p.into()))?,
+            self.known_id(o)?,
+        ) else {
+            return Ok(false);
+        };
+        self.r().has_triple(s, p, o)
+    }
+
     pub fn values(&self, s: &str, p: &str) -> Result<Vec<Term>> {
-        self.r().values(s, p)
+        let (Some(s), Some(p)) = (
+            self.known_id(&Term::Iri(s.into()))?,
+            self.known_id(&Term::Iri(p.into()))?,
+        ) else {
+            return Ok(Vec::new());
+        };
+        let r = self.r();
+        r.objects(s, p)?.into_iter().map(|o| r.term(o)).collect()
     }
 
     pub fn counts(&self) -> Counts {
