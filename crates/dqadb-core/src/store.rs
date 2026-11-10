@@ -55,6 +55,7 @@ CREATE INDEX IF NOT EXISTS props_txt ON props(p, txt) WHERE txt IS NOT NULL;
 CREATE TABLE IF NOT EXISTS vecs(id INTEGER PRIMARY KEY, seq INTEGER NOT NULL, hash BLOB NOT NULL, vec BLOB NOT NULL);
 CREATE INDEX IF NOT EXISTS vecs_seq ON vecs(seq);
 CREATE TABLE IF NOT EXISTS vec_dead(id INTEGER PRIMARY KEY, seq INTEGER NOT NULL);
+CREATE INDEX IF NOT EXISTS vec_dead_seq ON vec_dead(seq);
 ";
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -283,6 +284,8 @@ impl Store {
                         "store format {v}, this binary expects {STORE_FORMAT}"
                     )));
                 }
+                // added within format 6: makes "what changed since seq" an index lookup
+                conn.execute_batch("CREATE INDEX IF NOT EXISTS vec_dead_seq ON vec_dead(seq)")?;
             }
         }
         Ok(Self {
@@ -509,7 +512,7 @@ impl Reader<'_> {
     pub fn vec_changed_since(&self, seq: u64) -> Result<Vec<Id>> {
         let mut out = Vec::new();
         for sql in [
-            "SELECT id FROM vecs WHERE seq > ?1",
+            "SELECT id FROM vecs INDEXED BY vecs_seq WHERE seq > ?1",
             "SELECT id FROM vec_dead WHERE seq > ?1",
         ] {
             let mut st = self.conn.prepare_cached(sql)?;
@@ -519,6 +522,21 @@ impl Reader<'_> {
             }
         }
         Ok(out)
+    }
+
+    /// How many entities changed or lost their vector after `seq`.
+    pub fn vec_changed_count(&self, seq: u64) -> Result<u64> {
+        let mut n = 0u64;
+        for sql in [
+            "SELECT count(*) FROM vecs INDEXED BY vecs_seq WHERE seq > ?1",
+            "SELECT count(*) FROM vec_dead WHERE seq > ?1",
+        ] {
+            n += self
+                .conn
+                .prepare_cached(sql)?
+                .query_row([seq as i64], |r| r.get::<_, i64>(0))? as u64;
+        }
+        Ok(n)
     }
 
     /// Visit vectors with change sequence <= `seq`, in id order, `page` rows at a time

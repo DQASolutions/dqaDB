@@ -32,6 +32,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+mod runbook;
 mod stream;
 
 const DIM: usize = 768;
@@ -749,8 +750,64 @@ async fn lance_run(d: &Data, work: &Path, ft: &FilteredTruth, hnsw: bool) -> Rep
 async fn main() {
     let a: Vec<String> = std::env::args().collect();
     let (data_dir, work, which) = (PathBuf::from(&a[1]), PathBuf::from(&a[2]), a[3].as_str());
-    let max: usize = a.get(4).map(|v| v.parse().unwrap()).unwrap_or(1_000_000);
+    let max: usize = a.get(4).and_then(|v| v.parse().ok()).unwrap_or(1_000_000);
     std::fs::create_dir_all(&work).unwrap();
+    if let Some(cmd) = which.strip_prefix("rb-") {
+        // runbook modes: <data> <work> rb-<cmd> <runbook.yaml> <dataset> ...
+        let (rb, ds) = (PathBuf::from(&a[4]), a[5].as_str());
+        match cmd {
+            "gt" => {
+                // ... cos|ip <out dir> [comma-separated steps]
+                let s = runbook::setup(&data_dir, &rb, ds);
+                eprintln!("base {} x {}, {} queries, {} ops", s.base.n, s.base.d, s.queries.len(), s.ops.len());
+                let steps: Option<Vec<usize>> = a.get(8).map(|v| v.split(',').map(|x| x.parse().unwrap()).collect());
+                runbook::compute_truth(&s, &PathBuf::from(&a[7]), a[6] == "cos", steps.as_deref());
+            }
+            "compare" => {
+                // ... <official dir> <our dir> <steps>
+                let steps: Vec<usize> = a[8].split(',').map(|x| x.parse().unwrap()).collect();
+                runbook::compare_truth(&PathBuf::from(&a[6]), &PathBuf::from(&a[7]), &steps);
+            }
+            "dqadb" => {
+                // ... <truth dir> <label> [threads]
+                let s = runbook::setup(&data_dir, &rb, ds);
+                let threads = a.get(8).map(|v| v.parse().unwrap()).unwrap_or(4);
+                let rep = tokio::task::block_in_place(|| runbook::run_dqadb(s, &PathBuf::from(&a[6]), &work, &a[7], threads));
+                rep.print();
+                let out = work.join(format!("runbook-dqadb-{}.json", a[7]));
+                std::fs::write(&out, serde_json::to_vec_pretty(&rep).unwrap()).unwrap();
+            }
+            "qdrant" => {
+                // ... <truth dir> <label> [threads] [url]
+                let s = runbook::setup(&data_dir, &rb, ds);
+                let threads = a.get(8).map(|v| v.parse().unwrap()).unwrap_or(4);
+                let url = a.get(9).cloned().unwrap_or_else(|| "http://127.0.0.1:6333".into());
+                let rep = tokio::task::block_in_place(|| runbook::run_qdrant(s, &PathBuf::from(&a[6]), &a[7], &url, threads));
+                rep.print();
+                let out = work.join(format!("runbook-qdrant-{}.json", a[7]));
+                std::fs::write(&out, serde_json::to_vec_pretty(&rep).unwrap()).unwrap();
+            }
+            "diag" => {
+                // ... <nq> <ef,ef,...>   (on the state left in <work>/dqadb-runbook)
+                let s = runbook::setup(&data_dir, &rb, ds);
+                let nq: usize = a[6].parse().unwrap();
+                for ef in a[7].split(',') {
+                    runbook::diag(&work, &s.queries, nq, ef.parse().unwrap());
+                }
+            }
+            "diag-build" => {
+                // ... <nq> conn:add:quant:threads[,...]
+                let s = runbook::setup(&data_dir, &rb, ds);
+                let nq: usize = a[6].parse().unwrap();
+                for cfg in a[7].split(',') {
+                    let p: Vec<&str> = cfg.split(':').collect();
+                    runbook::diag_build(&work, &s.queries, nq, p[0].parse().unwrap(), p[1].parse().unwrap(), p[2], p[3].parse().unwrap());
+                }
+            }
+            other => panic!("unknown runbook command {other}"),
+        }
+        return;
+    }
     if which.starts_with("stream-") {
         let d = load(&data_dir, stream::MAX_ID);
         let rep = match which {

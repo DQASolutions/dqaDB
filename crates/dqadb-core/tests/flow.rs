@@ -643,7 +643,7 @@ fn semantic_search_embeds_lazily_and_reuses_the_cache() {
 }
 
 #[test]
-fn hnsw_base_plus_delta_matches_exact_and_stays_correct() {
+fn hnsw_segments_plus_delta_match_exact_and_stay_correct() {
     use dqadb_core::search::SearchQuery;
     // hash-test labels differ by one number, so vectors are near-duplicates and HNSW
     // (incremental or rebuilt) misses a few of them: the exact checks are about stale and
@@ -669,8 +669,8 @@ fn hnsw_base_plus_delta_matches_exact_and_stays_correct() {
         .unwrap();
     let report = kb.embed(true).unwrap();
     let c = report.compaction.expect("forced compaction");
-    assert!(c.built && c.vectors == 300, "{c:?}");
-    assert!(dir.path().join(".dqadb/vec/base.usearch").exists());
+    assert!(c.built && c.vectors == 300 && c.segments == 1, "{c:?}");
+    assert!(dir.path().join(".dqadb/vec/segments.json").exists());
 
     let sem = |q: &str, k: usize| -> Vec<String> {
         kb.search(&SearchQuery {
@@ -690,16 +690,16 @@ fn hnsw_base_plus_delta_matches_exact_and_stays_correct() {
         "{with_base:?}"
     );
 
-    // same answer as an exact scan (no base)
+    // same answer as an exact scan (no segments)
     std::fs::rename(
-        dir.path().join(".dqadb/vec/base.json"),
-        dir.path().join("base.json.bak"),
+        dir.path().join(".dqadb/vec/segments.json"),
+        dir.path().join("segments.json.bak"),
     )
     .unwrap();
     let exact = sem("bảo hiểm y tế", 10);
     std::fs::rename(
-        dir.path().join("base.json.bak"),
-        dir.path().join(".dqadb/vec/base.json"),
+        dir.path().join("segments.json.bak"),
+        dir.path().join(".dqadb/vec/segments.json"),
     )
     .unwrap();
     // labels differ only by a number, so scores tie: compare the topic, not the tie order
@@ -709,7 +709,7 @@ fn hnsw_base_plus_delta_matches_exact_and_stays_correct() {
     );
     assert_eq!(with_base.len(), exact.len());
 
-    // change one entity after the base was built: the base copy is ignored, the delta wins
+    // change one entity after the segment was built: its copy is ignored, the delta wins
     let o0 = res.id_map["_:o0"].replace("urn:dqadb:", "dqadb:");
     kb.assert(
         &ops(serde_json::json!([
@@ -731,7 +731,7 @@ fn hnsw_base_plus_delta_matches_exact_and_stays_correct() {
     let r = kb.embed(false).unwrap();
     assert!(
         r.compaction.is_none(),
-        "small delta must not trigger a rebuild"
+        "small delta must not trigger a flush"
     );
     assert_eq!(sem("trí tuệ nhân tạo", 1), vec!["Org 0 trí tuệ nhân tạo"]);
     let shipping = sem("vận tải biển", 60);
@@ -742,7 +742,7 @@ fn hnsw_base_plus_delta_matches_exact_and_stays_correct() {
         "stale vectors returned"
     );
 
-    // incremental update of the base: same answers, no stale vectors, delta now empty
+    // flush: the old copies become deletions of segment 1, the update a new segment
     let c = dqadb_core::ann::build(
         &dir.path().join(".dqadb/index.sqlite"),
         &dir.path().join(".dqadb/vec"),
@@ -750,9 +750,15 @@ fn hnsw_base_plus_delta_matches_exact_and_stays_correct() {
         false,
     )
     .unwrap();
-    assert!(c.built && c.incremental && c.vectors == 299, "{c:?}");
-    let meta = dqadb_core::ann::load_meta(&dir.path().join(".dqadb/vec")).unwrap();
-    assert_eq!(meta.churn, 2);
+    assert!(
+        c.built && c.incremental && c.vectors == 299 && c.segments == 2 && c.written == 1,
+        "{c:?}"
+    );
+    let m = dqadb_core::ann::load_manifest(&dir.path().join(".dqadb/vec")).unwrap();
+    assert_eq!(
+        m.segments.iter().map(|s| (s.count, s.deleted)).collect::<Vec<_>>(),
+        vec![(300, 2), (1, 0)]
+    );
     assert_eq!(sem("trí tuệ nhân tạo", 1), vec!["Org 0 trí tuệ nhân tạo"]);
     let shipping = sem("vận tải biển", 60);
     // approximate: allow a few misses on near-duplicates
@@ -765,9 +771,10 @@ fn hnsw_base_plus_delta_matches_exact_and_stays_correct() {
         !shipping
             .iter()
             .any(|l| l == "Org 0 vận tải biển" || l == "Org 6 vận tải biển"),
-        "stale vectors returned after incremental update"
+        "stale vectors returned after flush"
     );
-    // remove a third of the entities, re-add some as new ones: incremental again
+    // remove a third of the entities, add new ones: segment 1 passes the deletion
+    // threshold and is rebuilt from its live vectors (vacuum); the rest stays
     let mut list = Vec::new();
     for n in (1..300).filter(|n| n % 3 == 0 && *n != 6) {
         let t = topics[n % topics.len()];
@@ -790,6 +797,9 @@ fn hnsw_base_plus_delta_matches_exact_and_stays_correct() {
     )
     .unwrap();
     assert!(c.incremental && c.vectors == 299 - 98 + 40, "{c:?}");
+    let m = dqadb_core::ann::load_manifest(&dir.path().join(".dqadb/vec")).unwrap();
+    assert!(m.segments.iter().all(|s| s.deleted == 0), "{m:?}");
+    assert_eq!(c.written, 40 + 200, "{c:?}");
     // these 40 vectors are near-identical, the worst case for HNSW: check most are found
     let after = sem("năng lượng mặt trời", 40);
     let solar = after
@@ -810,7 +820,7 @@ fn hnsw_base_plus_delta_matches_exact_and_stays_correct() {
         before.iter().all(|l| l.contains("năng lượng mặt trời")),
         "{before:?}"
     );
-    // churn now above 25%: the next update is a full rebuild
+    // a forced full build puts everything back into one segment
     kb.assert(
         &ops(
             serde_json::json!([{"op": "add", "s": "_:z", "p": "rdf:type", "o": "ex:Organization"},
@@ -824,12 +834,13 @@ fn hnsw_base_plus_delta_matches_exact_and_stays_correct() {
         &dir.path().join(".dqadb/index.sqlite"),
         &dir.path().join(".dqadb/vec"),
         64,
-        false,
+        true,
     )
     .unwrap();
-    assert!(c.built && !c.incremental && c.vectors == 242, "{c:?}");
+    assert!(c.built && !c.incremental && c.vectors == 242 && c.segments == 1, "{c:?}");
+    assert_eq!(sem("trí tuệ nhân tạo", 1), vec!["Org 0 trí tuệ nhân tạo"]);
 
-    // index rebuild = new vector-table generation: the old base is ignored until recompacted
+    // index rebuild = new vector-table generation: old segments are ignored until rebuilt
     kb.rebuild().unwrap();
     kb.embed(false).unwrap();
     assert_eq!(sem("trí tuệ nhân tạo", 1), vec!["Org 0 trí tuệ nhân tạo"]);
