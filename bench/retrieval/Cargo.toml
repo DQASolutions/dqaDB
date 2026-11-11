@@ -1,0 +1,13 @@
+[package]
+name = "dqadb-bench-retrieval"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+# standalone, like the other benches
+[workspace]
+
+[dependencies]
+dqadb-core = { path = "../../crates/dqadb-core" }
+serde_json = "1"
+oxrdf = "0.3.5"

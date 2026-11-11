@@ -42,6 +42,17 @@ pub fn fold(s: &str) -> String {
         .collect()
 }
 
+/// `fold` for a query: the words are folded, but the operators AND / OR / NOT stay
+/// upper case (Lucene / tantivy syntax), else `a OR b` would search for the word "or".
+pub fn fold_query(q: &str) -> String {
+    q.split_inclusive(char::is_whitespace)
+        .map(|w| match w.trim_end() {
+            "AND" | "OR" | "NOT" => w.to_string(),
+            _ => fold(w),
+        })
+        .collect()
+}
+
 /// What the index reflects: the SQLite watermark it caught up to, and the configuration
 /// (indexed predicates, folding version) it was built with.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -192,7 +203,7 @@ impl Fts {
         let searcher = self.reader.searcher();
         let mut parser = QueryParser::for_index(&self.index, vec![self.text]);
         parser.set_conjunction_by_default();
-        let (q, _errors) = parser.parse_query_lenient(&fold(query));
+        let (q, _errors) = parser.parse_query_lenient(&fold_query(query));
         let top = TopDocs::with_limit(limit.max(1))
             .and_offset(offset)
             .order_by_score();
@@ -245,4 +256,16 @@ pub fn touched_subjects(
 
 pub fn dir(index_dir: &Path) -> PathBuf {
     index_dir.join("fts")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn query_folding_keeps_operators() {
+        assert_eq!(fold_query("Đà Nẵng OR Huế"), "da nang OR hue");
+        assert_eq!(fold_query("a AND NOT B"), "a AND NOT b");
+        assert_eq!(fold_query("Oregon or ORe"), "oregon or ore");
+    }
 }
