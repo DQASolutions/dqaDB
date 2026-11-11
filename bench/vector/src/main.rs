@@ -809,6 +809,15 @@ async fn main() {
                 let s = runbook::setup(&data_dir, &rb, ds);
                 runbook::diag_append(&work, &s.queries, a[6].parse().unwrap());
             }
+            "diag-dot" => {
+                // ... <n> <dim>
+                runbook::diag_dot(a[6].parse().unwrap(), a[7].parse().unwrap());
+            }
+            "diag-filter" => {
+                // ... <nq> <stale ids>
+                let s = runbook::setup(&data_dir, &rb, ds);
+                runbook::diag_filter(&work, &s.queries, a[6].parse().unwrap(), a[7].parse().unwrap());
+            }
             other => panic!("unknown runbook command {other}"),
         }
         return;

@@ -349,6 +349,38 @@ fn open_segments(dir: &Path, m: &Manifest) -> Result<Vec<Loaded>> {
     Ok(out)
 }
 
+/// Changes since the segments' flush: entities whose segment copy is stale, and the
+/// current vectors (decoded to f32 once) to scan exactly. Kept in memory per process and
+/// reloaded only when the store has new vector changes (Qdrant scans its in-memory
+/// appendable segment the same way); reading and decoding them per query cost ~40% of
+/// QPS at a 2k delta.
+struct Delta {
+    stale: HashSet<Id>,
+    rows: Vec<(Id, Vec<f32>)>,
+}
+
+type DeltaKey = (PathBuf, String, u64, u64);
+
+static DELTA: Mutex<Option<(DeltaKey, Arc<Delta>)>> = Mutex::new(None);
+
+fn delta(dir: &Path, m: &Manifest, r: &Reader) -> Result<Arc<Delta>> {
+    let key = (dir.to_path_buf(), m.epoch.clone(), m.seq, r.vec_seq()?);
+    let mut guard = DELTA.lock().unwrap_or_else(|p| p.into_inner());
+    if let Some((k, d)) = guard.as_ref()
+        && *k == key
+    {
+        return Ok(d.clone());
+    }
+    let stale = r.vec_changed_since(m.seq)?.into_iter().collect();
+    let mut rows = Vec::new();
+    r.vec_since(m.seq, |id, blob| {
+        rows.push((id, embed::from_f16_bytes(blob)))
+    })?;
+    let d = Arc::new(Delta { stale, rows });
+    *guard = Some((key, d.clone()));
+    Ok(d)
+}
+
 /// Open the segments of `m`; when a compaction replaced them meanwhile (their files are
 /// removed as soon as a newer `segments.json` is written), retry with the newer manifest,
 /// like Lucene's `SegmentInfos.FindSegmentsFile`. Returns the manifest used if not `m`.
@@ -386,7 +418,8 @@ pub fn search(
 ) -> Result<(Vec<(Id, f32)>, usize)> {
     let (newer, segments) = open_current(dir, m)?;
     let m = newer.as_ref().unwrap_or(m);
-    let stale: HashSet<u64> = r.vec_changed_since(m.seq)?.into_iter().collect();
+    let delta = delta(dir, m, r)?;
+    let stale = &delta.stale;
     let ef = ef();
     // Ask each segment for its whole search beam (>= ef): the top `n` of the same beam
     // is then a prefix of the top `n + k`, so pages of one query stay consistent.
@@ -454,11 +487,11 @@ pub fn search(
             hits.push((id, embed::dot_f16(query, blob, &mut bits, &mut buf)))
         })?;
     }
-    r.vec_since(m.seq, |id, blob| {
-        if allow.is_none_or(|a| a.contains(&id)) {
-            hits.push((id, embed::dot(query, &embed::from_f16_bytes(blob))));
+    for (id, v) in &delta.rows {
+        if allow.is_none_or(|a| a.contains(id)) {
+            hits.push((*id, embed::dot(query, v)));
         }
-    })?;
+    }
     hits.sort_by(|a, b| {
         b.1.partial_cmp(&a.1)
             .unwrap_or(std::cmp::Ordering::Equal)

@@ -460,7 +460,20 @@ pub fn dot_f16(query: &[f32], blob: &[u8], bits: &mut Vec<u16>, buf: &mut Vec<f3
 }
 
 pub fn dot(a: &[f32], b: &[f32]) -> f32 {
-    a.iter().zip(b).map(|(x, y)| x * y).sum()
+    // eight independent sums: lets the compiler use SIMD (a single running sum fixes the
+    // order of float additions and stays scalar)
+    let n = a.len().min(b.len());
+    let (a, b) = (&a[..n], &b[..n]);
+    let (ac, ar) = a.as_chunks::<8>();
+    let (bc, br) = b.as_chunks::<8>();
+    let mut acc = [0f32; 8];
+    for (x, y) in ac.iter().zip(bc) {
+        for i in 0..8 {
+            acc[i] += x[i] * y[i];
+        }
+    }
+    let tail: f32 = ar.iter().zip(br).map(|(x, y)| x * y).sum();
+    acc.iter().sum::<f32>() + tail
 }
 
 #[cfg(test)]

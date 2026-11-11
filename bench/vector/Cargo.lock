@@ -1878,6 +1878,7 @@ dependencies = [
  "arrow-schema",
  "dqadb-core",
  "futures",
+ "half",
  "lance-index",
  "lancedb",
  "memmap2",

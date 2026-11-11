@@ -529,6 +529,16 @@ pub fn run_dqadb(s: Setup, truth_dir: &Path, work: &Path, label: &str, threads: 
         rep.search_s += secs;
         let n_live = live.tag_vec.iter().filter(|v| v.is_some()).count();
         log_step(step, n_live, &by);
+        if std::env::var("RB_SEGLOG").is_ok() {
+            // segment state behind this step's numbers: (nodes, deleted%, deletion list?)
+            let vdir = dqadb_core::ann::dir(&root.join(".dqadb"));
+            if let Some(m) = dqadb_core::ann::load_manifest(&vdir) {
+                let store = dqadb_core::store::Store::open(&root.join(".dqadb/index.sqlite")).unwrap();
+                let delta = store.read().unwrap().vec_changed_count(m.seq).unwrap();
+                let segs: Vec<String> = m.segments.iter().map(|s| format!("{}k/{:.0}%{}", s.count / 1000, 100.0 * s.deleted as f64 / s.count as f64, if s.del.is_some() { "L" } else { "" })).collect();
+                eprintln!("        segments {} [{}] delta {delta}", m.segments.len(), segs.join(" "));
+            }
+        }
         rep.steps.push(StepResult { step, live: n_live, by_param: by });
     }
     unsafe { std::env::remove_var("DQADB_HNSW_EF") };
@@ -800,4 +810,66 @@ pub fn diag_append(work: &Path, queries: &[Vec<f32>], nq: usize) {
         let _ = std::fs::remove_file(&g);
     }
     let _ = std::fs::remove_file(&f);
+}
+
+/// Cost of the in-graph filter: plain search vs `filtered_search` with a std HashSet
+/// (SipHash) vs a multiplicative-hash set, `stale` random live ids, on the current segments.
+pub fn diag_filter(work: &Path, queries: &[Vec<f32>], nq: usize, stale: usize) {
+    use std::collections::HashSet;
+    use usearch::{Index, IndexOptions, MetricKind, ScalarKind};
+    #[derive(Default, Clone, Copy)]
+    struct Mul(u64);
+    impl std::hash::Hasher for Mul {
+        fn finish(&self) -> u64 { self.0 }
+        fn write(&mut self, _: &[u8]) { unreachable!() }
+        fn write_u64(&mut self, x: u64) { let m = (x as u128) * 0x9E37_79B9_7F4A_7C15u128; self.0 = (m as u64) ^ ((m >> 64) as u64); }
+    }
+    type Fast = HashSet<u64, std::hash::BuildHasherDefault<Mul>>;
+    let root = work.join("dqadb-runbook/.dqadb");
+    let dir = dqadb_core::ann::dir(&root);
+    let m = dqadb_core::ann::load_manifest(&dir).unwrap();
+    let qs: Vec<Vec<f32>> = queries.iter().take(nq).map(|q| { let n = q.iter().map(|x| x * x).sum::<f32>().sqrt(); q.iter().map(|x| x / n).collect() }).collect();
+    let mut ids: Vec<u64> = Vec::new();
+    let segs: Vec<Index> = m.segments.iter().map(|s| {
+        let i = Index::new(&IndexOptions { dimensions: m.dim, metric: MetricKind::Cos, quantization: ScalarKind::F16, connectivity: 16, expansion_add: 128, ..Default::default() }).unwrap();
+        i.view(dir.join(format!("{}.usearch", s.name)).to_str().unwrap()).unwrap();
+        i.change_expansion_search(128);
+        let raw = std::fs::read(dir.join(format!("{}.ids", s.name))).unwrap();
+        ids.extend(raw.chunks_exact(8).map(|c| u64::from_le_bytes(c.try_into().unwrap())));
+        i
+    }).collect();
+    let pick: Vec<u64> = ids.iter().copied().step_by((ids.len() / stale.max(1)).max(1)).take(stale).collect();
+    let sip: HashSet<u64> = pick.iter().copied().collect();
+    let fast: Fast = pick.iter().copied().collect();
+    let run = |name: &str, f: &dyn Fn(&Index, &[f32]) -> usize| {
+        let t = Instant::now();
+        let mut n = 0;
+        for q in &qs { for s in &segs { n += f(s, q); } }
+        eprintln!("{name:22} {:.2} ms/query  ({} segments, {n} hits)", t.elapsed().as_secs_f64() * 1e3 / qs.len() as f64, segs.len());
+    };
+    for _ in 0..2 {
+        run("plain", &|s, q| s.search(q, 128).unwrap().keys.len());
+        run("filtered SipHash", &|s, q| s.filtered_search(q, 128, |k| !sip.contains(&k)).unwrap().keys.len());
+        run("filtered mul-hash", &|s, q| s.filtered_search(q, 128, |k| !fast.contains(&k)).unwrap().keys.len());
+        run("filtered always-true", &|s, q| s.filtered_search(q, 128, |_| true).unwrap().keys.len());
+    }
+}
+
+/// Cost of the exact delta scan per query: decode f16 + scalar dot (old) vs cached f32
+/// with the SIMD-friendly dot (new), `n` vectors of `dim`.
+pub fn diag_dot(n: usize, dim: usize) {
+    let mut seed = 1u64;
+    let mut rnd = || { seed ^= seed << 13; seed ^= seed >> 7; seed ^= seed << 17; (seed % 2000) as f32 / 1000.0 - 1.0 };
+    let rows: Vec<Vec<f32>> = (0..n).map(|_| (0..dim).map(|_| rnd()).collect()).collect();
+    let blobs: Vec<Vec<u8>> = rows.iter().map(|v| v.iter().flat_map(|x| half::f16::from_f32(*x).to_le_bytes()).collect()).collect();
+    let q: Vec<f32> = (0..dim).map(|_| rnd()).collect();
+    let reps = 200;
+    let t = Instant::now();
+    let mut s = 0f32;
+    for _ in 0..reps { for b in &blobs { let v = dqadb_core::embed::from_f16_bytes(b); s += v.iter().zip(&q).map(|(x, y)| x * y).sum::<f32>(); } }
+    eprintln!("old: decode f16 + scalar dot  {:.3} ms/query  ({s:.0})", t.elapsed().as_secs_f64() * 1e3 / reps as f64);
+    let t = Instant::now();
+    let mut s = 0f32;
+    for _ in 0..reps { for v in &rows { s += dqadb_core::embed::dot(&q, v); } }
+    eprintln!("new: cached f32 + SIMD dot    {:.3} ms/query  ({s:.0})", t.elapsed().as_secs_f64() * 1e3 / reps as f64);
 }

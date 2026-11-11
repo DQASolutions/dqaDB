@@ -22,6 +22,7 @@ rayon = "1"
 serde_yaml = "0.9"
 memmap2 = "0.9"
 usearch = "=2.26.6"
+half = "2.7.1"
 ureq = { version = "3.5.1", features = ["json"] }
 
 [profile.release]
