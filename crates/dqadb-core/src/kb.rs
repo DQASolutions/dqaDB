@@ -230,7 +230,7 @@ impl Kb {
         self.store()
     }
 
-    fn store(&self) -> Result<Arc<Store>> {
+    pub(crate) fn store(&self) -> Result<Arc<Store>> {
         let mut guard = self.store.lock().unwrap();
         if let Some(s) = guard.as_ref() {
             return Ok(s.clone());
@@ -432,6 +432,14 @@ impl Kb {
 
     /// Validate input ops against the ontology and current state without writing.
     pub fn validate(&self, input: &[InputOp]) -> Result<ontology::Normalized> {
+        self.validate_with(input, true)
+    }
+
+    pub(crate) fn validate_with(
+        &self,
+        input: &[InputOp],
+        required: bool,
+    ) -> Result<ontology::Normalized> {
         ontology::check_fresh(&self.ontology_dir(), &self.generated_dir())?;
         let onto = self.ontology()?;
         self.sync()?;
@@ -440,11 +448,24 @@ impl Kb {
         let base = self.config.base_iri.clone();
         let mut mint = || format!("{base}{}", Ulid::generate());
         let existing = |s: &str, p: &str| r.values(s, p).unwrap_or_default();
-        onto.normalize(input, &mut mint, &existing)
+        onto.normalize_with(input, &mut mint, &existing, required)
             .map_err(Error::Validation)
     }
 
     pub fn assert(&self, input: &[InputOp], opts: &WriteOpts) -> Result<WriteResult> {
+        self.assert_with_source(input, opts, None, true)
+    }
+
+    /// `assert` with the source already stored (`opts.source` is used when `source` is
+    /// None): an import stores its file once for all of its events, and checks required
+    /// slots over the whole file instead of per event (`required` false).
+    pub(crate) fn assert_with_source(
+        &self,
+        input: &[InputOp],
+        opts: &WriteOpts,
+        source: Option<Source>,
+        required: bool,
+    ) -> Result<WriteResult> {
         let _lock = self.lock()?;
         let hash = ontology::check_fresh(&self.ontology_dir(), &self.generated_dir())?;
         let onto = self.ontology()?;
@@ -457,7 +478,7 @@ impl Kb {
         let base = self.config.base_iri.clone();
         let mut mint = || format!("{base}{}", Ulid::generate());
         let norm = onto
-            .normalize(input, &mut mint, &batch)
+            .normalize_with(input, &mut mint, &batch, required)
             .map_err(Error::Validation)?;
         self.commit(
             &store,
@@ -468,6 +489,7 @@ impl Kb {
             norm.id_map,
             norm.warnings,
             opts,
+            source,
         )
     }
 
@@ -514,6 +536,7 @@ impl Kb {
             Default::default(),
             Vec::new(),
             &opts,
+            None,
         )
     }
 
@@ -542,10 +565,12 @@ impl Kb {
         id_map: std::collections::BTreeMap<String, String>,
         mut warnings: Vec<String>,
         opts: &WriteOpts,
+        stored: Option<Source>,
     ) -> Result<WriteResult> {
-        let source = match &opts.source {
-            Some(p) => Some(self.store_source(p, &mut warnings)?),
-            None => None,
+        let source = match (stored, &opts.source) {
+            (Some(s), _) => Some(s),
+            (None, Some(p)) => Some(self.store_source(p, &mut warnings)?),
+            (None, None) => None,
         };
         let id = next_ulid(latest);
         let ev = Event {
@@ -607,6 +632,14 @@ impl Kb {
             path: shown,
             sha256: Some(h),
         })
+    }
+
+    /// Store a source file that must exist (imports).
+    pub(crate) fn store_source_once(&self, path: &Path) -> Result<Source> {
+        if !path.is_file() {
+            return Err(Error::other(format!("{} is not a file", path.display())));
+        }
+        self.store_source(path, &mut Vec::new())
     }
 
     pub fn new_ids(&self, n: usize) -> Vec<String> {

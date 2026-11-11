@@ -105,6 +105,29 @@ enum Cmd {
         #[command(flatten)]
         input: InputArgs,
     },
+    /// Import an RDF file (N-Triples, N-Quads, Turtle, TriG, RDF/XML, JSON-LD) as events
+    #[command(
+        after_help = "The whole file is validated against the ontology first; nothing is written unless\n\
+        every triple is valid. The file is copied into sources/ and the triples are written as\n\
+        events of --batch triples each. Blank nodes become new dqadb: entities.\n\n\
+        Examples:\n  dqadb import catalog.ttl --dry-run\n  dqadb import dump.nt --actor system:import --note \"ERP export 2026-11\""
+    )]
+    Import {
+        file: PathBuf,
+        /// nt | nq | ttl | trig | rdfxml | jsonld (default: from the file extension)
+        #[arg(long)]
+        format: Option<String>,
+        /// Triples per event
+        #[arg(long, default_value_t = dqadb_core::import::DEFAULT_BATCH)]
+        batch: usize,
+        /// Validate only; write nothing
+        #[arg(long)]
+        dry_run: bool,
+        #[arg(long)]
+        note: Option<String>,
+        #[command(flatten)]
+        write: WriteArgs,
+    },
     /// Retract every triple added by an earlier event
     #[command(
         after_help = "Example:\n  dqadb retract --event 01JC9X2K4M0A7Q8R3T5V6W7Y8Z --why \"wrong extraction\""
@@ -733,6 +756,64 @@ fn run(cli: Cli) -> Result<()> {
             }
             println!("ok: {} op(s) valid", n.ops.len());
             n.warnings.iter().for_each(|w| println!("  warning: {w}"));
+        }
+        Cmd::Import {
+            file,
+            format,
+            batch,
+            dry_run,
+            note,
+            write,
+        } => {
+            let opts = dqadb_core::import::ImportOpts {
+                format,
+                batch,
+                dry_run,
+            };
+            let quiet = json || !std::io::IsTerminal::is_terminal(&std::io::stderr());
+            let mut progress = |phase: &str, n: usize| {
+                if !quiet {
+                    eprint!("\r{phase} {n} triples");
+                }
+            };
+            let r = kb.import(&file, &opts, &write.opts(note), &mut progress)?;
+            if !quiet {
+                eprintln!();
+            }
+            if !r.issues.is_empty() {
+                let mut report = dqadb_core::error::ValidationReport::default();
+                for i in &r.issues {
+                    let more = if i.count > 1 {
+                        format!(" (and {} more)", i.count - 1)
+                    } else {
+                        String::new()
+                    };
+                    report.push(
+                        format!("triple {}{more}", i.first_triple),
+                        &i.message,
+                        i.fix.clone(),
+                    );
+                }
+                return Err(Error::Validation(report));
+            }
+            if json {
+                return print_json(&r);
+            }
+            if r.dry_run {
+                println!(
+                    "ok: {} triples valid ({}, {} blank nodes); nothing written",
+                    r.triples, r.format, r.blank_nodes
+                );
+            } else {
+                println!(
+                    "imported {} triples ({}) as {} event(s) in {:.1}s; {} blank nodes -> new entities",
+                    r.triples,
+                    r.format,
+                    r.events.len(),
+                    r.seconds,
+                    r.blank_nodes
+                );
+            }
         }
         Cmd::Retract { event, why, write } => {
             let r = kb.retract_event(&event, &why, &write.opts(None))?;

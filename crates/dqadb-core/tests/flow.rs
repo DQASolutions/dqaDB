@@ -1086,3 +1086,117 @@ fn semantic_search_with_loose_filters_post_filters_correctly() {
         }
     }
 }
+
+#[test]
+fn import_turtle_validates_whole_file_then_writes_batched_events() {
+    use dqadb_core::import::ImportOpts;
+    let (dir, kb) = new_kb();
+    // external IRIs, a blank node used across batches, typed / language / enum literals;
+    // with batch 2, Acme's type and its required label land in different events
+    let ttl = dir.path().join("orgs.ttl");
+    std::fs::write(
+        &ttl,
+        r#"@prefix ex: <https://example.org/ont#> .
+@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+@prefix xsd: <http://www.w3.org/2001/XMLSchema#> .
+<http://acme.example/org> a ex:Company ;
+    ex:country "VN" ;
+    rdfs:label "ACME"@en ;
+    ex:has_contract _:c .
+_:c a ex:Contract ;
+    rdfs:label "HĐ 1" ;
+    ex:value "1200.50"^^xsd:decimal ;
+    ex:status "active" .
+"#,
+    )
+    .unwrap();
+    let mut seen = Vec::new();
+    let dry = kb
+        .import(
+            &ttl,
+            &ImportOpts {
+                batch: 2,
+                dry_run: true,
+                ..Default::default()
+            },
+            &opts(),
+            &mut |phase, n| seen.push((phase.to_string(), n)),
+        )
+        .unwrap();
+    assert!(dry.issues.is_empty(), "{:?}", dry.issues);
+    assert_eq!((dry.triples, dry.blank_nodes, dry.events.len()), (8, 1, 0));
+    assert_eq!(seen.last().unwrap(), &("validated".to_string(), 8));
+    assert!(!dir.path().join("sources").read_dir().unwrap().any(|_| true));
+    assert_eq!(kb.status().unwrap().counts.triples, 0);
+
+    let r = kb
+        .import(
+            &ttl,
+            &ImportOpts {
+                batch: 2,
+                ..Default::default()
+            },
+            &opts(),
+            &mut |_, _| {},
+        )
+        .unwrap();
+    assert_eq!(r.events.len(), 4);
+    // one stored copy of the file, referenced by every event
+    let ev = kb.event(&r.events[3]).unwrap();
+    let src = ev.source.unwrap();
+    assert!(src.sha256.is_some() && src.path.ends_with("orgs.ttl"));
+    assert!(ev.note.unwrap().contains("part 4/4"));
+    let rows = select(
+        &kb,
+        "SELECT ?l ?v ?st WHERE { <http://acme.example/org> ex:has_contract ?c . ?c rdfs:label ?l ; ex:value ?v ; ex:status ?st }",
+    );
+    // decimals are stored canonical, as with `assert`
+    assert_eq!(
+        rows,
+        vec![vec![
+            "\"HĐ 1\"".to_string(),
+            "1200.5".into(),
+            "\"active\"".into()
+        ]]
+    );
+    // the blank node became one dqadb: entity
+    let c = select(&kb, "SELECT ?c WHERE { ?c a ex:Contract }");
+    assert_eq!(c.len(), 1);
+    assert!(c[0][0].starts_with("dqadb:"), "{c:?}");
+
+    // invalid file: nothing written, issues counted per kind with the first position
+    let bad = dir.path().join("bad.nt");
+    std::fs::write(
+        &bad,
+        "<http://x.example/a> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <https://example.org/ont#Company> .\n\
+         <http://x.example/a> <https://example.org/ont#ceo> \"Ann\" .\n\
+         <http://x.example/b> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <https://example.org/ont#Company> .\n\
+         <http://x.example/b> <https://example.org/ont#ceo> \"Bob\" .\n",
+    )
+    .unwrap();
+    let before = kb.status().unwrap().counts.triples;
+    let r = kb
+        .import(&bad, &ImportOpts::default(), &opts(), &mut |_, _| {})
+        .unwrap();
+    assert!(r.events.is_empty());
+    let issues: Vec<(String, usize, usize)> = r
+        .issues
+        .iter()
+        .map(|i| (i.message.clone(), i.count, i.first_triple))
+        .collect();
+    assert_eq!(
+        issues,
+        vec![
+            ("Organization requires rdfs:label".to_string(), 2, 1),
+            ("unknown predicate ex:ceo".to_string(), 2, 2)
+        ]
+    );
+    assert_eq!(kb.status().unwrap().counts.triples, before);
+    // named graphs are refused
+    let nq = dir.path().join("g.nq");
+    std::fs::write(&nq, "<http://x.example/a> <http://www.w3.org/2000/01/rdf-schema#label> \"A\" <http://g.example/1> .\n").unwrap();
+    let e = kb
+        .import(&nq, &ImportOpts::default(), &opts(), &mut |_, _| {})
+        .unwrap_err();
+    assert!(e.to_string().contains("named graph"), "{e}");
+}

@@ -37,15 +37,19 @@ cat > facts.json <<'EOF'
 EOF
 dqadb assert -f facts.json --actor agent:extractor --source contract.pdf
 dqadb get dqadb:<id printed above>
+dqadb import catalog.ttl --dry-run    # RDF files: nt, nq, ttl, trig, rdf/xml, json-ld
+dqadb import catalog.ttl --actor system:import
 dqadb events ls
 rm -rf .dqadb && dqadb rebuild   # same fingerprint as before
 ```
+
+`import` validates the whole file against the ontology before writing anything (issues are counted per kind, with the first triple that has each), copies the file into `sources/` once, and writes the triples as events of 50,000 (`--batch`) that all point to it. Blank nodes become new `dqadb:` entities; triples in named graphs are refused (dqaDB's named graphs are its events). Required slots are checked over the whole file, so an entity's type and label may sit in different batches.
 
 Exit codes: 0 ok · 1 error · 2 validation · 3 not found · 4 ontology not built/stale · 5 index stale · 6 version conflict or lock timeout. `--json` gives machine-readable output (errors go to stderr as JSON).
 
 ## Status (milestone M1)
 
-Done: `init`, `status`, `rebuild`, `verify`, `new-id`, `ontology build|show`, `assert`, `validate`, `retract --event`, `get`, `query` (SPARQL 1.1), `search` (`--text` full-text, `--type`, `--where` filters), `traverse`, `path`, `events show|ls`; RDFS subclass inference.
+Done: `init`, `status`, `rebuild`, `verify`, `new-id`, `ontology build|show`, `assert`, `validate`, `import`, `retract --event`, `get`, `query` (SPARQL 1.1), `search` (`--text` full-text, `--type`, `--where` filters), `traverse`, `path`, `events show|ls`; RDFS subclass inference.
 Validation enforces the LinkML schema directly (known predicates/classes, ranges, enums, required, single-valued).
 
 Not yet: web UI (M3). SHACL: validation runs from LinkML directly; `shapes.ttl` is an export (no runtime SHACL engine until hand-written shapes need one).

@@ -415,6 +415,29 @@ impl Ontology {
     }
 
     /// The class and all its ancestors (is_a chain).
+    /// Whether `slot_iri` is required by some class.
+    pub fn is_required(&self, slot_iri: &str) -> bool {
+        self.slots.get(slot_iri).is_some_and(|s| s.required)
+    }
+
+    /// Display form of an IRI (CURIE when a prefix matches).
+    pub fn short(&self, iri: &str) -> String {
+        self.compact(iri)
+    }
+
+    /// Required slots of a class and its ancestors: (class name, slot IRI).
+    pub fn required_slots(&self, class_iri: &str) -> Vec<(String, String)> {
+        let mut out = Vec::new();
+        for c in self.lineage(class_iri) {
+            for slot_iri in &c.slots {
+                if self.slots.get(slot_iri).is_some_and(|s| s.required) {
+                    out.push((c.name.clone(), slot_iri.clone()));
+                }
+            }
+        }
+        out
+    }
+
     pub fn lineage(&self, class_iri: &str) -> Vec<&ClassDef> {
         let mut out = Vec::new();
         let mut seen = HashSet::new();
@@ -440,6 +463,18 @@ impl Ontology {
         input: &[InputOp],
         mint: &mut dyn FnMut() -> String,
         existing: &dyn Existing,
+    ) -> std::result::Result<Normalized, ValidationReport> {
+        self.normalize_with(input, mint, existing, true)
+    }
+
+    /// `normalize`; with `required` false the required-slot check is left to the caller
+    /// (an import checks it over the whole file, not per batch).
+    pub fn normalize_with(
+        &self,
+        input: &[InputOp],
+        mint: &mut dyn FnMut() -> String,
+        existing: &dyn Existing,
+        required: bool,
     ) -> std::result::Result<Normalized, ValidationReport> {
         let mut report = ValidationReport::default();
         let mut out = Normalized::default();
@@ -492,7 +527,7 @@ impl Ontology {
         }
 
         if report.is_empty() {
-            self.check_cardinality(&out.ops, existing, &mut report, &mut out.warnings);
+            self.check_cardinality(&out.ops, existing, required, &mut report, &mut out.warnings);
         }
         if report.is_empty() {
             Ok(out)
@@ -581,7 +616,19 @@ impl Ontology {
                 }
             }
             Range::Enum(name) => {
-                let Some(v) = o.as_str() else {
+                // a plain string, or an RDF literal typed xsd:string (as an import gives)
+                let plain = o.as_object().and_then(|m| {
+                    let ty = m
+                        .get("@type")
+                        .and_then(|t| t.as_str())
+                        .map(|t| self.prefixes.expand(t));
+                    match (m.get("@value").and_then(|v| v.as_str()), ty) {
+                        (Some(v), None) => Some(v),
+                        (Some(v), Some(Ok(t))) if t == rdf::XSD_STRING => Some(v),
+                        _ => None,
+                    }
+                });
+                let Some(v) = o.as_str().or(plain) else {
                     report.push(at, format!("{pname} expects one of enum {name}"), None);
                     return None;
                 };
@@ -705,6 +752,7 @@ impl Ontology {
         &self,
         ops: &[Op],
         existing: &dyn Existing,
+        required: bool,
         report: &mut ValidationReport,
         warnings: &mut Vec<String>,
     ) {
@@ -758,7 +806,7 @@ impl Ontology {
                 typed.entry(&op.s).or_default().push(c);
             }
         }
-        for (s, classes) in typed {
+        for (s, classes) in typed.into_iter().filter(|_| required) {
             for class in classes {
                 for c in self.lineage(class) {
                     for slot_iri in &c.slots {

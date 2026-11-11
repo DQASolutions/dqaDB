@@ -26,6 +26,7 @@ tokenizers = { version = "0.23.2", default-features = false, features = ["onig"]
 ulid = "3.0.0"
 unicode-normalization = "0.1.26"
 usearch = "=2.26.6"
+oxrdfio = "0.2.7"
 
 [dev-dependencies]
 tempfile = "3.27.0"

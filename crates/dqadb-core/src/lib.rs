@@ -7,6 +7,7 @@ pub mod embed;
 pub mod error;
 pub mod event;
 pub mod fts;
+pub mod import;
 pub mod kb;
 pub mod lock;
 pub mod ontology;
