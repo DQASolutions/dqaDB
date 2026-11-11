@@ -43,6 +43,8 @@ dqadb events ls
 rm -rf .dqadb && dqadb rebuild   # same fingerprint as before
 ```
 
+`events/HEAD` names the newest event; writers update it after each event file and repair it from the files, readers use it to see whether the index is behind without listing event directories. After copying event files in by hand, run any write or `dqadb rebuild`.
+
 `import` validates the whole file against the ontology before writing anything (issues are counted per kind, with the first triple that has each), copies the file into `sources/` once, and writes the triples as events of 50,000 (`--batch`) that all point to it. Blank nodes become new `dqadb:` entities; triples in named graphs are refused (dqaDB's named graphs are its events). Required slots are checked over the whole file, so an entity's type and label may sit in different batches.
 
 Exit codes: 0 ok · 1 error · 2 validation · 3 not found · 4 ontology not built/stale · 5 index stale · 6 version conflict or lock timeout. `--json` gives machine-readable output (errors go to stderr as JSON).

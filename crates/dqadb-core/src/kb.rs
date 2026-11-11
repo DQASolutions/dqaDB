@@ -292,7 +292,7 @@ impl Kb {
             let r = store.read()?;
             (r.watermark()?, r.inference_hash()?)
         };
-        let latest = event::latest(&self.events_dir())?;
+        let latest = event::head(&self.events_dir())?;
         if latest <= wm && rules.as_deref() == Some(inference.hash.as_str()) {
             return Ok(0);
         }
@@ -308,6 +308,7 @@ impl Kb {
             (r.watermark()?, r.inference_hash()?)
         };
         let files = event::list_after(&self.events_dir(), wm)?;
+        event::repair_head(&self.events_dir())?;
         if files.is_empty() && rules.as_deref() != Some(inference.hash.as_str()) {
             // ontology hierarchy changed: opening a batch recomputes inferences
             store.batch(inference)?.commit()?;
@@ -327,6 +328,7 @@ impl Kb {
         }
         let tmp = tmp_root.join("index.sqlite");
         let files = event::list_after(&self.events_dir(), None)?;
+        event::repair_head(&self.events_dir())?;
         let inference = self.ontology()?.inference();
         let (counts, fingerprint) = {
             let store = Store::open_bulk(&tmp)?;
@@ -556,7 +558,7 @@ impl Kb {
     }
 
     fn check_expected(&self, opts: &WriteOpts) -> Result<Option<Ulid>> {
-        let latest = event::latest(&self.events_dir())?;
+        let latest = event::repair_head(&self.events_dir())?;
         if let Some(exp) = &opts.expected_version {
             let actual = latest.map(|u| u.to_string()).unwrap_or_default();
             if *exp != actual {
@@ -599,6 +601,7 @@ impl Kb {
             ops,
         };
         let path = event::write_atomic(&self.events_dir(), &ev)?;
+        event::write_head(&self.events_dir(), id)?;
         // The event is durable now; if indexing fails, the next command catches up.
         let stats = batch.apply(&ev)?;
         batch.commit()?;

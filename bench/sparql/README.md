@@ -58,7 +58,7 @@ Results are compared by value (dqaDB stores canonical literals, e.g. `1200.5` fo
 |---|---|---|
 | Load | 3.0 s (bulk loader) | 14.8 s (`import`: validation, event files, source copy, index) |
 | Disk | 45 MB | 156 MB index (+ 105 MB events, 92 MB source copy) |
-| Query mix | **802 queries/s** (17.1 s) | **289 queries/s** (47.6 s) |
+| Query mix | **802 queries/s** (17.1 s) | **343 queries/s** (40.1 s) |
 | Results | | **13,750 / 13,750 identical** |
 | Peak RSS | 83 MB | 136 MB |
 
@@ -67,7 +67,7 @@ Mean latency per BSBM query template (ms):
 | | T1 | T2 | T3 | T4 | T5 | T6 | T7 | T8 | T9 | T10 | T11 |
 |---|---|---|---|---|---|---|---|---|---|---|---|
 | Oxigraph | 0.28 | 1.07 | 0.48 | 0.51 | 7.05 | 1.30 | 0.92 | 0.09 | 0.80 | 0.14 | 0.28 |
-| dqaDB | 1.08 | 2.30 | 1.55 | 1.29 | 21.04 | 3.10 | 2.41 | 0.90 | 1.93 | 0.94 | 1.13 |
+| dqaDB | 0.45 | 1.73 | 0.99 | 0.72 | 20.99 | 2.53 | 1.84 | 0.26 | 1.35 | 0.31 | 0.51 |
 
 T1 product type + features + numeric filter · T2 product details · T3 type + feature
 negation · T4 UNION · T5 similar products (numeric range joins) · T6 product + offers +
@@ -77,12 +77,15 @@ of an entity · T11 CONSTRUCT offer. Empty-result shares are the same on both sy
 creates).
 
 Reading:
-- dqaDB returns the same answers; it is 2.8x slower on the mix. About 0.7 ms per query
-  is fixed cost of `Kb::query` (freshness check against the event files), the rest is
-  the dataset layer: T5, a join with numeric range filters, is 3x slower.
-- Before this run, `Kb::query` re-parsed the schema files twice per query (3.6 ms fixed
-  cost; 168 queries/s on the first 1000 queries). The parsed ontology is now cached until
-  a schema file changes, as SQLite caches its schema until the schema cookie changes.
+- dqaDB returns the same answers; it is 2.3x slower on the mix, and T5 (similar
+  products: a join with numeric range filters, 3x slower) is more than half of its time.
+  The other templates are 1.3–3x slower; the gap there is the dataset layer.
+- Fixed cost per `Kb::query`, measured with `overhead`, went from 3.6 ms to 0.11 ms
+  (168 -> 343 queries/s): the schema files were parsed twice per query (now kept until a
+  schema file changes, like SQLite's schema cookie), the RDFS rules were recomputed per
+  query (now once per parsed schema), and the freshness check listed the newest day's
+  event files (now reads `events/HEAD`, a pointer the writer updates, like Lucene's
+  `segments_N`).
 
 `overhead <kb dir>` times the fixed per-query steps; `compare a.jsonl b.jsonl` checks
 results query by query.

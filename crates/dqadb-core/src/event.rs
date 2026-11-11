@@ -216,6 +216,53 @@ pub fn list_after(events_dir: &Path, after: Option<Ulid>) -> Result<Vec<(Ulid, P
 }
 
 /// Newest event id on disk (scans only the newest non-empty day).
+/// `events/HEAD`: the newest event's ULID, written by the writer (under the write lock)
+/// right after each event file, so readers learn whether anything is new by reading one
+/// small file instead of listing the newest day directory (Lucene finds its current
+/// commit through `segments_N` the same way). Writers check it against the files and
+/// repair it; it can lag only if a writer died between the event file and HEAD.
+pub const HEAD_FILE: &str = "HEAD";
+
+/// Newest event as recorded in HEAD; without a readable HEAD (older KBs, events copied
+/// in by hand), the newest event file.
+pub fn head(events_dir: &Path) -> Result<Option<Ulid>> {
+    match fs::read_to_string(events_dir.join(HEAD_FILE)) {
+        Ok(s) => match parse_ulid(s.trim()) {
+            Ok(id) => Ok(Some(id)),
+            Err(_) => latest(events_dir),
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => latest(events_dir),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Point HEAD at `id` (atomic replace). Callers hold the write lock.
+pub fn write_head(events_dir: &Path, id: Ulid) -> Result<()> {
+    fs::create_dir_all(events_dir)?;
+    let tmp = events_dir.join(".HEAD.tmp");
+    {
+        let mut f = File::create(&tmp)?;
+        f.write_all(format!("{id}\n").as_bytes())?;
+        f.sync_all()?;
+    }
+    fs::rename(&tmp, events_dir.join(HEAD_FILE))?;
+    Ok(())
+}
+
+/// Make HEAD match the newest event file (callers hold the write lock); returns it.
+pub fn repair_head(events_dir: &Path) -> Result<Option<Ulid>> {
+    let actual = latest(events_dir)?;
+    let recorded = fs::read_to_string(events_dir.join(HEAD_FILE))
+        .ok()
+        .and_then(|s| parse_ulid(s.trim()).ok());
+    if let Some(id) = actual
+        && recorded != actual
+    {
+        write_head(events_dir, id)?;
+    }
+    Ok(actual)
+}
+
 pub fn latest(events_dir: &Path) -> Result<Option<Ulid>> {
     for (_, dir) in day_dirs(events_dir)?.into_iter().rev() {
         if let Some((id, _)) = day_files(&dir)?.into_iter().next_back() {

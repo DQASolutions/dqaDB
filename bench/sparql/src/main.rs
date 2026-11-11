@@ -437,6 +437,18 @@ fn overhead(dir: &Path) {
     time("Kb::ontology()", &|| {
         kb.ontology().unwrap();
     });
+    time("ontology().inference()", &|| {
+        kb.ontology().unwrap().inference();
+    });
+    time("event::head()", &|| {
+        dqadb_core::event::head(&kb.events_dir()).unwrap();
+    });
+    let store = dqadb_core::store::Store::open(&kb.index_dir().join("index.sqlite")).unwrap();
+    time("store.read() + watermark", &|| {
+        let r = store.read().unwrap();
+        r.watermark().unwrap();
+        r.inference_hash().unwrap();
+    });
     time("Kb::sync() (nothing new)", &|| {
         kb.sync().unwrap();
     });

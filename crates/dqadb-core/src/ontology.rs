@@ -125,6 +125,8 @@ pub struct Ontology {
     pub type_bases: BTreeMap<String, String>,
     /// `sha256:<hex>` over all schema files; recorded in every event.
     pub hash: String,
+    /// computed on first use (callers keep the parsed ontology, see `Kb::ontology`)
+    inference_cache: std::sync::OnceLock<Inference>,
 }
 
 /// RDFS rules the index materialises: `rdf:type` along `rdfs:subClassOf` (LinkML `is_a`).
@@ -132,8 +134,8 @@ pub struct Ontology {
 /// types from them would hide data errors that validation should report.
 #[derive(Debug, Clone, Default)]
 pub struct Inference {
-    /// class IRI -> proper ancestors, nearest first
-    ancestors: BTreeMap<String, Vec<String>>,
+    /// class IRI -> proper ancestors, nearest first (shared: cloning is cheap)
+    ancestors: std::sync::Arc<BTreeMap<String, Vec<String>>>,
     /// changes whenever the rules change; stored in the index to detect stale inferences
     pub hash: String,
 }
@@ -145,7 +147,7 @@ impl Inference {
             h.update(format!("{c} < {}\n", a.join(" ")));
         }
         Self {
-            ancestors,
+            ancestors: std::sync::Arc::new(ancestors),
             hash: format!("sha256:{}", hex::encode(h.finalize())),
         }
     }
@@ -427,11 +429,18 @@ impl Ontology {
             enums,
             type_bases,
             hash,
+            inference_cache: Default::default(),
         })
     }
 
     /// RDFS entailment rules derived from the schema (spec §7).
     pub fn inference(&self) -> Inference {
+        self.inference_cache
+            .get_or_init(|| self.compute_inference())
+            .clone()
+    }
+
+    fn compute_inference(&self) -> Inference {
         let ancestors: BTreeMap<String, Vec<String>> = self
             .classes
             .keys()

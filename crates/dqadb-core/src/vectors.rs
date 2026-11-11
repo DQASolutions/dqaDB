@@ -251,6 +251,9 @@ impl Kb {
             Some(s) => s.watermark.as_deref().map(event::parse_ulid).transpose()?,
             None => None,
         };
+        if event::head(&self.events_dir())? <= wm {
+            return Ok(0);
+        }
         Ok(event::list_after(&self.events_dir(), wm)?.len())
     }
 

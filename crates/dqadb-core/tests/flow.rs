@@ -1260,3 +1260,76 @@ fn linkml_types_and_local_datetimes() {
         r.issues
     );
 }
+
+#[test]
+fn readers_find_new_events_through_head() {
+    use dqadb_core::event;
+    let (dir, kb) = new_kb();
+    let events = dir.path().join("events");
+    let first = kb.assert(&acme(), &opts()).unwrap();
+    let head = |p: &std::path::Path| std::fs::read_to_string(p.join("HEAD")).unwrap();
+    assert_eq!(head(&events).trim(), first.event_id);
+
+    // another process writes: a fresh reader learns about it from HEAD alone
+    let writer = Kb::open(dir.path()).unwrap();
+    let second = writer
+        .assert(
+            &ops(
+                serde_json::json!([{"op": "add", "s": "_:b", "p": "rdf:type", "o": "ex:Company"},
+                                    {"op": "add", "s": "_:b", "p": "rdfs:label", "o": "Beta"}]),
+            ),
+            &opts(),
+        )
+        .unwrap();
+    assert_eq!(head(&events).trim(), second.event_id);
+    assert_eq!(
+        select(
+            &kb,
+            "SELECT ?l WHERE { ?c a ex:Company ; rdfs:label ?l } ORDER BY ?l"
+        )
+        .len(),
+        2
+    );
+
+    // an event file written without HEAD (writer died in between): readers do not see it
+    // yet; the next write (which checks the files) repairs HEAD and indexes it
+    let mut ev = kb.event(&second.event_id).unwrap();
+    let late = ulid::Ulid::generate();
+    ev.event_id = late.to_string();
+    for op in &mut ev.ops {
+        op.s = op.s.replace(&second.id_map["_:b"], "urn:dqadb:late");
+        if let dqadb_core::rdf::Term::Literal(l) = &mut op.o {
+            l.value = "Late".into();
+        }
+    }
+    event::write_atomic(&events, &ev).unwrap();
+    assert_eq!(head(&events).trim(), second.event_id);
+    let labels = |kb: &Kb| {
+        select(
+            kb,
+            "SELECT ?l WHERE { ?c a ex:Company ; rdfs:label ?l } ORDER BY ?l",
+        )
+    };
+    assert_eq!(labels(&kb).len(), 2);
+    kb.assert(
+        &ops(
+            serde_json::json!([{"op": "add", "s": "_:z", "p": "rdf:type", "o": "ex:Company"},
+                                {"op": "add", "s": "_:z", "p": "rdfs:label", "o": "Zeta"}]),
+        ),
+        &opts(),
+    )
+    .unwrap();
+    assert_eq!(labels(&kb).len(), 4, "{:?}", labels(&kb));
+
+    // no HEAD (older KB): readers fall back to listing the files
+    std::fs::remove_file(events.join("HEAD")).unwrap();
+    let fresh = Kb::open(dir.path()).unwrap();
+    assert_eq!(labels(&fresh).len(), 4);
+    // a HEAD ahead of the files is repaired by the next sync
+    std::fs::write(events.join("HEAD"), format!("{}\n", ulid::Ulid::generate())).unwrap();
+    assert_eq!(labels(&fresh).len(), 4);
+    assert_eq!(
+        event::head(&events).unwrap(),
+        event::latest(&events).unwrap()
+    );
+}
