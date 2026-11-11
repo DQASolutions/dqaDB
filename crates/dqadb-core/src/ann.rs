@@ -81,8 +81,6 @@ pub const MAX_SEGMENT: usize = 262_144;
 /// Rebuild a segment once this share of its nodes is deleted (Qdrant's default 0.2).
 pub const VACUUM_DELETED: f64 = 0.2;
 const BUILD_PAGE: usize = 4096;
-/// Unreferenced segment files are removed once they are this old.
-const GC_GRACE: Duration = Duration::from_secs(600);
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Segment {
@@ -254,8 +252,36 @@ fn read_keys(path: &Path) -> Result<Vec<Id>> {
 
 // ---- reader-side cache (one per process; files are immutable, keyed by name) ----
 
+/// A segment graph viewed in place over a mapping this process owns. usearch's own
+/// `view(path)` is not used: when its open fails (file just removed by a compaction) it
+/// still closes descriptor 0 on cleanup (2.26.6 `memory_mapped_file_t::close`), which
+/// can close a file another component of the process holds.
+struct Viewed {
+    // declared first: dropped before the mapping it reads
+    index: Index,
+    _map: memmap2::Mmap,
+}
+
+impl std::ops::Deref for Viewed {
+    type Target = Index;
+    fn deref(&self) -> &Index {
+        &self.index
+    }
+}
+
+fn view_file(path: &Path, dim: usize, quant: &str) -> Result<Viewed> {
+    let file = std::fs::File::open(path)?;
+    // SAFETY: segment files are immutable once renamed into place and are replaced only
+    // by new names; a removed file stays readable while mapped
+    let map = unsafe { memmap2::Mmap::map(&file)? };
+    let index = Index::new(&options(dim, quant)).map_err(ann_err)?;
+    // SAFETY: `map` lives in the same struct and is dropped after `index`
+    unsafe { index.view_from_buffer(&map) }.map_err(ann_err)?;
+    Ok(Viewed { index, _map: map })
+}
+
 struct Loaded {
-    index: Arc<Index>,
+    index: Arc<Viewed>,
     deleted: Arc<HashSet<Id>>,
 }
 
@@ -274,7 +300,7 @@ fn file_key(path: &Path) -> FileKey {
 
 #[derive(Default)]
 struct Cache {
-    indexes: HashMap<FileKey, Arc<Index>>,
+    indexes: HashMap<FileKey, Arc<Viewed>>,
     deletions: HashMap<FileKey, Arc<HashSet<Id>>>,
 }
 
@@ -292,9 +318,7 @@ fn open_segments(dir: &Path, m: &Manifest) -> Result<Vec<Loaded>> {
         let index = match cache.indexes.get(&file) {
             Some(i) => i.clone(),
             None => {
-                let index = Index::new(&options(m.dim, &m.quant)).map_err(ann_err)?;
-                index.view(path_str(&path)?).map_err(ann_err)?;
-                let index = Arc::new(index);
+                let index = Arc::new(view_file(&path, m.dim, &m.quant)?);
                 cache.indexes.insert(file.clone(), index.clone());
                 index
             }
@@ -325,6 +349,30 @@ fn open_segments(dir: &Path, m: &Manifest) -> Result<Vec<Loaded>> {
     Ok(out)
 }
 
+/// Open the segments of `m`; when a compaction replaced them meanwhile (their files are
+/// removed as soon as a newer `segments.json` is written), retry with the newer manifest,
+/// like Lucene's `SegmentInfos.FindSegmentsFile`. Returns the manifest used if not `m`.
+fn open_current(dir: &Path, m: &Manifest) -> Result<(Option<Manifest>, Vec<Loaded>)> {
+    let mut err = match open_segments(dir, m) {
+        Ok(s) => return Ok((None, s)),
+        Err(e) => e,
+    };
+    let mut seen = m.clone();
+    for _ in 0..5 {
+        match load_manifest(dir) {
+            Some(newer) if newer != seen => match open_segments(dir, &newer) {
+                Ok(s) => return Ok((Some(newer), s)),
+                Err(e) => {
+                    err = e;
+                    seen = newer;
+                }
+            },
+            _ => break,
+        }
+    }
+    Err(err)
+}
+
 /// Top `n` by cosine across the segments (skipping deleted nodes and entities changed
 /// since the last flush) merged with an exact scan of the delta, optionally restricted
 /// to `allow`. Returns (hits, vectors considered).
@@ -336,8 +384,9 @@ pub fn search(
     n: usize,
     allow: Option<&HashSet<u64>>,
 ) -> Result<(Vec<(Id, f32)>, usize)> {
+    let (newer, segments) = open_current(dir, m)?;
+    let m = newer.as_ref().unwrap_or(m);
     let stale: HashSet<u64> = r.vec_changed_since(m.seq)?.into_iter().collect();
-    let segments = open_segments(dir, m)?;
     let ef = ef();
     // Ask each segment for its whole search beam (>= ef): the top `n` of the same beam
     // is then a prefix of the top `n + k`, so pages of one query stay consistent.
@@ -437,7 +486,13 @@ fn new_job(m: &mut Manifest, ids: Vec<Id>) -> Job {
 /// Build one segment from (id, f16 bytes) rows, inserting from a single thread:
 /// usearch graphs built by concurrent inserts are measurably worse (135k Wikipedia
 /// vectors, recall@10 at ef 512: 0.995 with 1 thread, 0.989 with 2, 0.982 with 4).
-fn build_one(dir: &Path, dim: usize, quant: &str, name: &str, rows: &[(Id, Vec<u8>)]) -> Result<Segment> {
+fn build_one(
+    dir: &Path,
+    dim: usize,
+    quant: &str,
+    name: &str,
+    rows: &[(Id, Vec<u8>)],
+) -> Result<Segment> {
     let index = Index::new(&options(dim, quant)).map_err(ann_err)?;
     index
         .reserve_capacity_and_threads(rows.len().max(1), 1)
@@ -509,7 +564,13 @@ fn write_segments(dir: &Path, r: &Reader, m: &Manifest, jobs: Vec<Job>) -> Resul
 /// `ids` into it from a single thread, the same sequential inserts a fresh build does.
 /// Costs the appended vectors instead of a rebuild of all of them. The new segment has
 /// no deletion list; its tombstones stay counted in `deleted` until a vacuum.
-fn append_into(dir: &Path, r: &Reader, m: &mut Manifest, dest: &Segment, ids: &[Id]) -> Result<Segment> {
+fn append_into(
+    dir: &Path,
+    r: &Reader,
+    m: &mut Manifest,
+    dest: &Segment,
+    ids: &[Id],
+) -> Result<Segment> {
     let index = Index::new(&options(m.dim, &m.quant)).map_err(ann_err)?;
     index
         .load(path_str(&dir.join(format!("{}.usearch", dest.name)))?)
@@ -590,7 +651,10 @@ fn plan_merge_with(segs: &[(usize, usize)], cap: usize) -> Option<Vec<usize>> {
     Some(small)
 }
 
-/// Remove files no manifest refers to any more, once they are old enough.
+/// Remove the files the manifest no longer refers to, right after it is written (as
+/// Lucene's IndexFileDeleter does): processes that still map them keep reading them
+/// (POSIX unlink semantics) and readers that have not opened them yet retry with the new
+/// manifest. A file that cannot be removed (open on Windows) is retried next time.
 fn collect_garbage(dir: &Path, m: &Manifest) {
     let mut keep: HashSet<String> = HashSet::new();
     for s in &m.segments {
@@ -603,7 +667,6 @@ fn collect_garbage(dir: &Path, m: &Manifest) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
-    let now = SystemTime::now();
     for e in entries.flatten() {
         let name = e.file_name().to_string_lossy().into_owned();
         let ours = (name.starts_with('s') && name.len() > 9 && name[1..9].bytes().all(|b| b.is_ascii_digit()))
@@ -612,14 +675,7 @@ fn collect_garbage(dir: &Path, m: &Manifest) {
         if !ours || keep.contains(&name) {
             continue;
         }
-        let old = e
-            .metadata()
-            .and_then(|md| md.modified())
-            .map(|t| now.duration_since(t).unwrap_or_default() >= GC_GRACE)
-            .unwrap_or(false);
-        if old {
-            let _ = std::fs::remove_file(e.path());
-        }
+        let _ = std::fs::remove_file(e.path());
     }
 }
 
@@ -810,7 +866,10 @@ mod tests {
         // far over the cap: merge enough to get back to it
         assert_eq!(plan_merge_with(&[(f, 0); 10], 4).unwrap().len(), 7);
         // a segment past the deletion threshold is vacuumed first
-        assert_eq!(plan_merge_with(&[(f, 0), (100_000, 25_000)], 4), Some(vec![1]));
+        assert_eq!(
+            plan_merge_with(&[(f, 0), (100_000, 25_000)], 4),
+            Some(vec![1])
+        );
         // full-size segments do not count and are never merged
         let mut segs = vec![(MAX_SEGMENT, 0); 6];
         segs.extend([(f, 0); 4]);

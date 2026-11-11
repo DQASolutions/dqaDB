@@ -705,6 +705,7 @@ dependencies = [
  "chrono",
  "half",
  "hex",
+ "memmap2",
  "ort",
  "oxrdf",
  "rayon",

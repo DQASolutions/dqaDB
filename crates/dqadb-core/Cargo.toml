@@ -8,6 +8,7 @@ publish.workspace = true
 [dependencies]
 chrono = { version = "0.4.45", default-features = false, features = ["std", "clock"] }
 half = "2.7.1"
+memmap2 = "0.9.12"
 hex = "0.4.3"
 ort = { version = "=2.0.0-rc.15", default-features = false, features = ["std", "load-dynamic"] }
 oxrdf = "0.3.5"

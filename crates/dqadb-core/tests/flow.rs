@@ -756,7 +756,10 @@ fn hnsw_segments_plus_delta_match_exact_and_stay_correct() {
     );
     let m = dqadb_core::ann::load_manifest(&dir.path().join(".dqadb/vec")).unwrap();
     assert_eq!(
-        m.segments.iter().map(|s| (s.count, s.deleted)).collect::<Vec<_>>(),
+        m.segments
+            .iter()
+            .map(|s| (s.count, s.deleted))
+            .collect::<Vec<_>>(),
         vec![(300, 2), (1, 0)]
     );
     assert_eq!(sem("trí tuệ nhân tạo", 1), vec!["Org 0 trí tuệ nhân tạo"]);
@@ -830,6 +833,7 @@ fn hnsw_segments_plus_delta_match_exact_and_stay_correct() {
         .collect();
     let mut old_labels = Vec::new();
     let mut appended = false;
+    let mut stale_read = false;
     for round in 0..dqadb_core::ann::max_segments() + 3 {
         let mut pick: Vec<usize> = live_ids[10 * round..10 * round + 10].to_vec();
         if round > 0 {
@@ -850,13 +854,16 @@ fn hnsw_segments_plus_delta_match_exact_and_stay_correct() {
                 }
             };
             let new = format!("Org {n} {}x{} hàng không", word(n), word(round));
-            list.push(serde_json::json!({"op": "retract", "s": s, "p": "rdfs:label", "o": label[&n]}));
+            list.push(
+                serde_json::json!({"op": "retract", "s": s, "p": "rdfs:label", "o": label[&n]}),
+            );
             list.push(serde_json::json!({"op": "add", "s": s, "p": "rdfs:label", "o": new}));
             old_labels.push(std::mem::replace(label.get_mut(&n).unwrap(), new));
         }
         kb.assert(&ops(serde_json::Value::Array(list)), &opts())
             .unwrap();
         kb.embed_sync().unwrap();
+        let before = dqadb_core::ann::load_manifest(&dir.path().join(".dqadb/vec")).unwrap();
         let c = dqadb_core::ann::build(
             &dir.path().join(".dqadb/index.sqlite"),
             &dir.path().join(".dqadb/vec"),
@@ -865,13 +872,54 @@ fn hnsw_segments_plus_delta_match_exact_and_stay_correct() {
         )
         .unwrap();
         assert_eq!(c.vectors, 241, "{c:?}");
+        // a reader still holding the previous manifest (its files may be gone) retries
+        // with the current one
+        let store =
+            dqadb_core::store::Store::open(&dir.path().join(".dqadb/index.sqlite")).unwrap();
+        let reader = store.read().unwrap();
+        let q: Vec<f32> = (0..64).map(|i| if i == 0 { 1.0 } else { 0.0 }).collect();
+        let (hits, _) = dqadb_core::ann::search(
+            &dir.path().join(".dqadb/vec"),
+            &before,
+            &reader,
+            &q,
+            5,
+            None,
+        )
+        .unwrap();
+        assert_eq!(hits.len(), 5);
+        stale_read |= before.segments.iter().any(|s| {
+            !dir.path()
+                .join(format!(".dqadb/vec/{}.usearch", s.name))
+                .exists()
+        });
         let m = dqadb_core::ann::load_manifest(&dir.path().join(".dqadb/vec")).unwrap();
-        assert!(m.segments.len() <= dqadb_core::ann::max_segments() + 1, "{m:?}");
+        assert!(
+            m.segments.len() <= dqadb_core::ann::max_segments() + 1,
+            "{m:?}"
+        );
         appended |= m.segments.iter().any(|s| s.deleted > 0 && s.del.is_none());
+        // files of replaced segments are removed right away
+        let referenced =
+            2 * m.segments.len() + m.segments.iter().filter(|s| s.del.is_some()).count();
+        let on_disk = std::fs::read_dir(dir.path().join(".dqadb/vec"))
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().starts_with('s'))
+            .filter(|e| e.file_name() != "segments.json")
+            .count();
+        assert_eq!(on_disk, referenced, "{m:?}");
         // an append inserts only the smaller segments' vectors, never all of them
         assert!(c.written < 241, "{c:?}");
     }
-    assert!(appended, "no merge appended into a graph with deleted nodes");
+    assert!(
+        appended,
+        "no merge appended into a graph with deleted nodes"
+    );
+    assert!(
+        stale_read,
+        "no search ran on a manifest whose files were removed"
+    );
     let all = sem("hàng không", 300);
     for l in &old_labels {
         assert!(!all.contains(l), "replaced label {l} returned");
@@ -897,7 +945,10 @@ fn hnsw_segments_plus_delta_match_exact_and_stay_correct() {
         true,
     )
     .unwrap();
-    assert!(c.built && !c.incremental && c.vectors == 242 && c.segments == 1, "{c:?}");
+    assert!(
+        c.built && !c.incremental && c.vectors == 242 && c.segments == 1,
+        "{c:?}"
+    );
     assert_eq!(sem("trí tuệ nhân tạo", 1), vec!["Org 0 trí tuệ nhân tạo"]);
 
     // index rebuild = new vector-table generation: old segments are ignored until rebuilt
