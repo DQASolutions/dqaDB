@@ -176,7 +176,7 @@ fn retract_event_and_expected_version() {
 }
 
 fn select(kb: &Kb, q: &str) -> Vec<Vec<String>> {
-    let prefixes = kb.ontology().unwrap().prefixes;
+    let prefixes = kb.ontology().unwrap().prefixes.clone();
     match kb.query(q, &Limits::default()).unwrap() {
         Answer::Solutions { rows, .. } => rows
             .iter()

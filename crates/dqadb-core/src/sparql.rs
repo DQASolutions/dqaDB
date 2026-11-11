@@ -278,12 +278,16 @@ pub fn run(
         Error::Validation(r)
     })?;
 
+    // watchdog: cancels the query at the timeout, and exits as soon as the query is done
+    // (dropping `_done` disconnects the channel)
     let token = CancellationToken::new();
     let timer = token.clone();
     let timeout = limits.timeout;
+    let (_done, done) = std::sync::mpsc::channel::<()>();
     std::thread::spawn(move || {
-        std::thread::sleep(timeout);
-        timer.cancel();
+        if let Err(std::sync::mpsc::RecvTimeoutError::Timeout) = done.recv_timeout(timeout) {
+            timer.cancel();
+        }
     });
     let evaluator = QueryEvaluator::new().with_cancellation_token(token);
     let timed_out = |e: spareval::QueryEvaluationError| {

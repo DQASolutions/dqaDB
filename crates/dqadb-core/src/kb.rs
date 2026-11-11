@@ -28,6 +28,8 @@ pub struct Kb {
     pub root: PathBuf,
     pub config: Config,
     store: Mutex<Option<Arc<Store>>>,
+    /// parsed ontology, reused while no schema file changed (see `ontology`)
+    ontology: Mutex<Option<(SchemaStamp, Arc<Ontology>)>>,
     pub lock_timeout: Duration,
     /// configured embedding model, loaded on first use
     pub(crate) embedder: crate::embed::LazyEmbedder,
@@ -216,6 +218,7 @@ impl Kb {
             root,
             config,
             store: Mutex::new(None),
+            ontology: Mutex::new(None),
             lock_timeout: Duration::from_secs(10),
             embedder,
         })
@@ -249,12 +252,24 @@ impl Kb {
         self.store.lock().unwrap().take();
     }
 
-    pub fn ontology(&self) -> Result<Ontology> {
-        Ontology::load(
+    /// The parsed ontology. Parsing the schema files costs ~1 ms per call (more with big
+    /// schemas), so it is kept and reused until a schema file is added, removed or
+    /// modified (name, size and mtime), like SQLite's schema cookie.
+    pub fn ontology(&self) -> Result<Arc<Ontology>> {
+        let stamp = schema_stamp(&self.ontology_dir())?;
+        let mut cache = self.ontology.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some((s, o)) = cache.as_ref()
+            && *s == stamp
+        {
+            return Ok(o.clone());
+        }
+        let o = Arc::new(Ontology::load(
             &self.ontology_dir(),
             &self.main_schema(),
             &self.config.base_iri,
-        )
+        )?);
+        *cache = Some((stamp, o.clone()));
+        Ok(o)
     }
 
     pub fn build_ontology(&self, lock_only: bool) -> Result<ontology::BuildLock> {
@@ -345,7 +360,7 @@ impl Kb {
         if fts_dir.exists() {
             std::fs::remove_dir_all(&fts_dir)?;
         }
-        let (_, text_documents) = self.fts_locked(&store, &self.ontology()?)?;
+        let (_, text_documents) = self.fts_locked(&store, &*self.ontology()?)?;
         Ok(RebuildReport {
             events: files.len(),
             counts,
@@ -883,4 +898,25 @@ fn fts_predicates(onto: &Ontology) -> Vec<String> {
         .collect();
     v.sort();
     v
+}
+
+/// Name, size and modification time of every schema file: changes whenever a schema
+/// file is added, removed or edited (a same-size edit within the filesystem's mtime
+/// resolution is the one case it misses; `ontology build` rewrites the lock file anyway).
+type SchemaStamp = Vec<(String, u64, Option<std::time::SystemTime>)>;
+
+fn schema_stamp(dir: &Path) -> Result<SchemaStamp> {
+    let mut out = Vec::new();
+    if dir.exists() {
+        for e in std::fs::read_dir(dir)? {
+            let e = e?;
+            let name = e.file_name().to_string_lossy().into_owned();
+            if name.ends_with(ontology::SCHEMA_SUFFIX) {
+                let m = e.metadata()?;
+                out.push((name, m.len(), m.modified().ok()));
+            }
+        }
+    }
+    out.sort();
+    Ok(out)
 }

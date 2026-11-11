@@ -1,19 +1,29 @@
-//! Tier-2 benchmark (graph / SPARQL): BSBM on dqaDB vs Oxigraph.
+//! Tier-2 benchmark (graph / SPARQL): BSBM explore queries on dqaDB vs Oxigraph. Both
+//! evaluate SPARQL with the same engine (spareval 0.2.9); what differs is storage,
+//! indexes and the dataset layer.
 //!
 //! Modes:
-//!   bsbm-schema <data.nt> <out.linkml.yaml>   product-type classes from the data
+//!   bsbm-schema <data.nt> <out.linkml.yaml>     product-type classes from the data
+//!   dq-load <data.nt> <schema dir> <kb dir>      fresh dqaDB KB with the schema, timed import
+//!   ox-load <data.nt> <store dir>                fresh Oxigraph store, timed bulk load
+//!   run dqadb|oxigraph <dir> <mix.tsv.zst> <out.jsonl> [max queries]
+//!                                                the queries of a BSBM mix in order, one client
+//!   compare <a.jsonl> <b.jsonl>                  per-query result equality (by value)
 
 use std::collections::BTreeMap;
-use std::io::{BufReader, Write};
+use std::hash::{Hash, Hasher};
+use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
-use oxrdf::{NamedOrBlankNode, Term};
+use oxrdf::{NamedOrBlankNode, Term, Triple};
 use oxrdfio::{RdfFormat, RdfParser};
 
 const BSBM: &str = "http://www4.wiwiss.fu-berlin.de/bizer/bsbm/v01/vocabulary/";
 const INST: &str = "http://www4.wiwiss.fu-berlin.de/bizer/bsbm/v01/instances/";
 const RDF_TYPE: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type";
 const SUBCLASS: &str = "http://www.w3.org/2000/01/rdf-schema#subClassOf";
+const XSD: &str = "http://www.w3.org/2001/XMLSchema#";
 
 /// BSBM product types are data: `inst:ProductTypeN a bsbm:ProductType ; rdfs:subClassOf
 /// inst:ProductTypeM`, and products are typed with them. dqaDB's ontology is closed, so
@@ -58,12 +68,405 @@ fn bsbm_schema(data: &Path, out: &Path) {
     eprintln!("{} product types -> {}", types.len(), out.display());
 }
 
+fn dir_mb(p: &Path) -> f64 {
+    fn walk(p: &Path) -> u64 {
+        let Ok(rd) = std::fs::read_dir(p) else {
+            return std::fs::metadata(p).map(|m| m.len()).unwrap_or(0);
+        };
+        rd.flatten()
+            .map(|e| {
+                let m = e.metadata().unwrap();
+                if m.is_dir() { walk(&e.path()) } else { m.len() }
+            })
+            .sum()
+    }
+    walk(p) as f64 / 1e6
+}
+
+fn peak_rss_mb() -> f64 {
+    std::fs::read_to_string("/proc/self/status")
+        .ok()
+        .and_then(|s| {
+            s.lines().find(|l| l.starts_with("VmHWM:")).and_then(|l| {
+                l.split_whitespace()
+                    .nth(1)
+                    .and_then(|v| v.parse::<f64>().ok())
+            })
+        })
+        .unwrap_or(0.0)
+        / 1024.0
+}
+
+fn dq_load(data: &Path, schema: &Path, kb_dir: &Path) {
+    use dqadb_core::{Kb, WriteOpts, import::ImportOpts};
+    let _ = std::fs::remove_dir_all(kb_dir);
+    std::fs::create_dir_all(kb_dir).unwrap();
+    Kb::init(kb_dir, "urn:dqadb:").unwrap();
+    let onto = kb_dir.join("ontology");
+    std::fs::remove_file(onto.join("schema.linkml.yaml")).unwrap();
+    for e in std::fs::read_dir(schema).unwrap().flatten() {
+        let name = e.file_name().to_string_lossy().to_string();
+        let to = if name == "bsbm.linkml.yaml" {
+            "schema.linkml.yaml".to_string()
+        } else {
+            name
+        };
+        std::fs::copy(e.path(), onto.join(to)).unwrap();
+    }
+    let kb = Kb::open(kb_dir).unwrap();
+    kb.build_ontology(true).unwrap();
+    let t = Instant::now();
+    let write = WriteOpts {
+        actor: "system:bench".into(),
+        ..Default::default()
+    };
+    let r = kb
+        .import(data, &ImportOpts::default(), &write, &mut |_, _| {})
+        .unwrap();
+    assert!(r.issues.is_empty(), "{:?}", r.issues);
+    let secs = t.elapsed().as_secs_f64();
+    println!(
+        "dqaDB load: {} triples in {secs:.1}s ({:.0} triples/s), {} events; disk {:.0} MB (index {:.0} MB); peak RSS {:.0} MB",
+        r.triples,
+        r.triples as f64 / secs,
+        r.events.len(),
+        dir_mb(kb_dir),
+        dir_mb(&kb_dir.join(".dqadb")),
+        peak_rss_mb()
+    );
+}
+
+fn ox_load(data: &Path, dir: &Path) {
+    let _ = std::fs::remove_dir_all(dir);
+    let store = oxigraph::store::Store::open(dir).unwrap();
+    let t = Instant::now();
+    let mut loader = store.bulk_loader();
+    loader
+        .load_from_reader(RdfFormat::NTriples, std::fs::File::open(data).unwrap())
+        .unwrap();
+    loader.commit().unwrap();
+    store.flush().unwrap();
+    let secs = t.elapsed().as_secs_f64();
+    let n = store.len().unwrap();
+    drop(store);
+    println!(
+        "Oxigraph load: {n} triples in {secs:.1}s ({:.0} triples/s); disk {:.0} MB; peak RSS {:.0} MB",
+        n as f64 / secs,
+        dir_mb(dir),
+        peak_rss_mb()
+    );
+}
+
+/// Query lines of a BSBM mix file (`query\t<sparql>` / `update\t<sparql>`).
+fn mix_queries(path: &Path) -> Vec<String> {
+    let r = BufReader::new(zstd::Decoder::new(std::fs::File::open(path).unwrap()).unwrap());
+    r.lines()
+        .map(|l| l.unwrap())
+        .filter_map(|l| l.strip_prefix("query\t").map(str::to_string))
+        .collect()
+}
+
+/// BSBM query template: the text without prefixes, IRIs, literals and numbers.
+fn template(q: &str) -> String {
+    let mut out = String::new();
+    let mut chars = q.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '<' => {
+                for d in chars.by_ref() {
+                    if d == '>' {
+                        break;
+                    }
+                }
+                out.push_str("<>");
+            }
+            '"' => {
+                for d in chars.by_ref() {
+                    if d == '"' {
+                        break;
+                    }
+                }
+                out.push_str("\"\"");
+            }
+            c if c.is_ascii_digit() => {
+                while chars
+                    .peek()
+                    .is_some_and(|d| d.is_ascii_digit() || *d == '.')
+                {
+                    chars.next();
+                }
+                out.push('0');
+            }
+            c if c.is_whitespace() => {
+                if !out.ends_with(' ') {
+                    out.push(' ');
+                }
+            }
+            c => out.push(c),
+        }
+    }
+    // drop the PREFIX declarations
+    let start = ["SELECT", "DESCRIBE", "CONSTRUCT", "ASK"]
+        .iter()
+        .filter_map(|k| out.find(k))
+        .min()
+        .unwrap_or(0);
+    out[start..].trim().to_string()
+}
+
+/// A term compared by value: numbers (any numeric XSD type or a decimal-based schema
+/// type such as bsbm:USD) as numbers, everything else as its lexical form.
+fn canon(t: &Term) -> String {
+    match t {
+        Term::NamedNode(n) => format!("<{}>", n.as_str()),
+        Term::BlankNode(_) => "_:b".into(),
+        Term::Literal(l) => {
+            let dt = l.datatype().as_str();
+            let numeric = dt.strip_prefix(XSD).is_some_and(|x| {
+                matches!(
+                    x,
+                    "integer" | "decimal" | "double" | "float" | "int" | "long"
+                )
+            }) || dt.ends_with("/USD");
+            if numeric && let Ok(v) = l.value().parse::<f64>() {
+                return format!("{v}");
+            }
+            match l.language() {
+                Some(lang) => format!("{}@{lang}", l.value()),
+                None => l.value().to_string(),
+            }
+        }
+        #[allow(unreachable_patterns)]
+        _ => t.to_string(),
+    }
+}
+
+enum Out {
+    Rows(Vec<Vec<Option<Term>>>),
+    Triples(Vec<Triple>),
+    Bool(bool),
+}
+
+fn canon_out(o: &Out) -> Vec<String> {
+    let mut v: Vec<String> = match o {
+        Out::Rows(rows) => rows
+            .iter()
+            .map(|r| {
+                r.iter()
+                    .map(|t| t.as_ref().map(canon).unwrap_or_default())
+                    .collect::<Vec<_>>()
+                    .join("\t")
+            })
+            .collect(),
+        Out::Triples(ts) => ts
+            .iter()
+            .map(|t| {
+                format!(
+                    "{} <{}> {}",
+                    canon(&t.subject.clone().into()),
+                    t.predicate.as_str(),
+                    canon(&t.object)
+                )
+            })
+            .collect(),
+        Out::Bool(b) => vec![b.to_string()],
+    };
+    v.sort();
+    v
+}
+
+trait System {
+    fn run(&self, q: &str) -> Out;
+}
+
+struct Dq(dqadb_core::Kb);
+impl System for Dq {
+    fn run(&self, q: &str) -> Out {
+        use dqadb_core::sparql::{Answer, Limits};
+        let limits = Limits {
+            rows: usize::MAX,
+            timeout: std::time::Duration::from_secs(600),
+        };
+        match self.0.query(q, &limits).unwrap() {
+            Answer::Solutions { rows, .. } => Out::Rows(rows),
+            Answer::Graph { triples, .. } => Out::Triples(triples),
+            Answer::Boolean(b) => Out::Bool(b),
+        }
+    }
+}
+
+struct Ox(oxigraph::store::Store);
+impl System for Ox {
+    fn run(&self, q: &str) -> Out {
+        use oxigraph::sparql::{QueryResults, SparqlEvaluator};
+        match SparqlEvaluator::new()
+            .parse_query(q)
+            .unwrap()
+            .on_store(&self.0)
+            .execute()
+            .unwrap()
+        {
+            QueryResults::Solutions(s) => {
+                let vars: Vec<_> = s.variables().to_vec();
+                Out::Rows(
+                    s.map(|r| {
+                        let r = r.unwrap();
+                        vars.iter().map(|v| r.get(v).cloned()).collect()
+                    })
+                    .collect(),
+                )
+            }
+            QueryResults::Graph(g) => Out::Triples(g.map(|t| t.unwrap()).collect()),
+            QueryResults::Boolean(b) => Out::Bool(b),
+        }
+    }
+}
+
+fn run(system: &str, dir: &Path, mix: &Path, out: &Path, max: Option<usize>) {
+    let mut queries = mix_queries(mix);
+    if let Some(m) = max {
+        queries.truncate(m);
+    }
+    let sys: Box<dyn System> = match system {
+        "dqadb" => Box::new(Dq(dqadb_core::Kb::open(dir).unwrap())),
+        "oxigraph" => Box::new(Ox(oxigraph::store::Store::open(dir).unwrap())),
+        other => panic!("unknown system {other}"),
+    };
+    let mut templates: BTreeMap<String, usize> = BTreeMap::new();
+    let mut per_t: BTreeMap<usize, (usize, f64, usize)> = BTreeMap::new(); // count, secs, empty
+    let mut f = std::io::BufWriter::new(std::fs::File::create(out).unwrap());
+    let started = Instant::now();
+    let mut total = 0.0;
+    for (i, q) in queries.iter().enumerate() {
+        let next = templates.len() + 1;
+        let tid = *templates.entry(template(q)).or_insert(next);
+        let t = Instant::now();
+        let o = sys.run(q);
+        let secs = t.elapsed().as_secs_f64();
+        total += secs;
+        let rows = canon_out(&o);
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        rows.hash(&mut h);
+        let e = per_t.entry(tid).or_default();
+        e.0 += 1;
+        e.1 += secs;
+        e.2 += rows.is_empty() as usize;
+        writeln!(
+            f,
+            "{}",
+            serde_json::json!({"i": i, "t": tid, "ms": secs * 1e3, "n": rows.len(), "hash": format!("{:016x}", h.finish()), "head": rows.iter().take(3).collect::<Vec<_>>()})
+        )
+        .unwrap();
+        if (i + 1) % 1000 == 0 {
+            eprintln!(
+                "  {} queries, {:.0} s",
+                i + 1,
+                started.elapsed().as_secs_f64()
+            );
+        }
+    }
+    let n = queries.len();
+    println!(
+        "{system}: {n} queries in {total:.1}s ({:.1} queries/s); peak RSS {:.0} MB",
+        n as f64 / total,
+        peak_rss_mb()
+    );
+    let mut by_id: Vec<(&String, &usize)> = templates.iter().collect();
+    by_id.sort_by_key(|(_, id)| **id);
+    for (tpl, id) in by_id {
+        let (c, s, e) = per_t[id];
+        println!(
+            "  T{id:<2} n={c:<5} mean {:7.2} ms  empty {:3.0}%  {}",
+            s * 1e3 / c as f64,
+            100.0 * e as f64 / c as f64,
+            tpl.chars().take(70).collect::<String>()
+        );
+    }
+}
+
+fn compare(a: &Path, b: &Path) {
+    let read = |p: &Path| -> Vec<serde_json::Value> {
+        BufReader::new(std::fs::File::open(p).unwrap())
+            .lines()
+            .map(|l| serde_json::from_str(&l.unwrap()).unwrap())
+            .collect()
+    };
+    let (a, b) = (read(a), read(b));
+    let mut diff: BTreeMap<u64, Vec<u64>> = BTreeMap::new();
+    for (x, y) in a.iter().zip(&b) {
+        if x["hash"] != y["hash"] {
+            diff.entry(x["t"].as_u64().unwrap())
+                .or_default()
+                .push(x["i"].as_u64().unwrap());
+        }
+    }
+    println!(
+        "{} queries compared, {} differ",
+        a.len().min(b.len()),
+        diff.values().map(Vec::len).sum::<usize>()
+    );
+    for (t, is) in &diff {
+        let i = is[0] as usize;
+        println!(
+            "  T{t}: {} differ, e.g. query {i}: n {} vs {}\n    a {}\n    b {}",
+            is.len(),
+            a[i]["n"],
+            b[i]["n"],
+            a[i]["head"],
+            b[i]["head"]
+        );
+    }
+}
+
+/// Fixed per-query costs of `Kb::query` on a KB, each step timed alone.
+fn overhead(dir: &Path) {
+    use dqadb_core::sparql::Limits;
+    let kb = dqadb_core::Kb::open(dir).unwrap();
+    let n = 200;
+    let time = |name: &str, f: &dyn Fn()| {
+        f();
+        let t = Instant::now();
+        for _ in 0..n {
+            f();
+        }
+        println!(
+            "{name:28} {:7.3} ms",
+            t.elapsed().as_secs_f64() * 1e3 / n as f64
+        );
+    };
+    time("Kb::ontology()", &|| {
+        kb.ontology().unwrap();
+    });
+    time("Kb::sync() (nothing new)", &|| {
+        kb.sync().unwrap();
+    });
+    time("Kb::fingerprint()", &|| {
+        kb.fingerprint().unwrap();
+    });
+    let q = "ASK { <urn:x> <urn:y> <urn:z> }";
+    time("Kb::query(ASK, no match)", &|| {
+        kb.query(q, &Limits::default()).unwrap();
+    });
+}
+
 fn main() {
     let a: Vec<String> = std::env::args().collect();
+    let p = |i: usize| PathBuf::from(&a[i]);
     match a.get(1).map(String::as_str) {
-        Some("bsbm-schema") => bsbm_schema(&PathBuf::from(&a[2]), &PathBuf::from(&a[3])),
+        Some("bsbm-schema") => bsbm_schema(&p(2), &p(3)),
+        Some("dq-load") => dq_load(&p(2), &p(3), &p(4)),
+        Some("ox-load") => ox_load(&p(2), &p(3)),
+        Some("run") => run(
+            &a[2],
+            &p(3),
+            &p(4),
+            &p(5),
+            a.get(6).map(|v| v.parse().unwrap()),
+        ),
+        Some("compare") => compare(&p(2), &p(3)),
+        Some("overhead") => overhead(&p(2)),
         _ => {
-            eprintln!("usage: dqadb-bench-sparql bsbm-schema <data.nt> <out.linkml.yaml>");
+            eprintln!("see the module docs for modes");
             std::process::exit(2);
         }
     }

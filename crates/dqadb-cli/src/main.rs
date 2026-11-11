@@ -850,7 +850,7 @@ fn run(cli: Cli) -> Result<()> {
             if json {
                 return print_json(&sparql::to_json(&answer));
             }
-            let prefixes = kb.ontology()?.prefixes;
+            let prefixes = kb.ontology()?.prefixes.clone();
             print_answer(&prefixes, &answer);
         }
         Cmd::Search {
