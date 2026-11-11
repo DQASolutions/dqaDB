@@ -484,11 +484,18 @@ fn full_text_is_accent_insensitive_lazy_and_self_repairing() {
         .collect()
     };
 
-    // accents and đ/d are ignored, case too; terms are ANDed
+    // accents and đ/d are ignored, case too; any word matches, more words rank higher
     assert_eq!(text(&kb, "hai phong", &[]), vec!["ACME Logistics"]);
     assert_eq!(text(&kb, "Hải Phòng", &[]), vec!["ACME Logistics"]);
     assert_eq!(text(&kb, "duong sat", &[]), vec!["Beta Đường Sắt"]);
-    assert!(text(&kb, "hai phong duong", &[]).is_empty());
+    assert_eq!(
+        text(&kb, "hai phong duong", &[]),
+        vec!["ACME Logistics", "Beta Đường Sắt"]
+    );
+    // required words: AND / + (operators are not folded into words)
+    assert!(text(&kb, "hai AND phong AND duong", &[]).is_empty());
+    assert!(text(&kb, "+hai +duong", &[]).is_empty());
+    assert_eq!(text(&kb, "hai AND phong", &[]), vec!["ACME Logistics"]);
     // combined with a structured filter (filter first, then BM25)
     assert_eq!(text(&kb, "hd", &["ex:Contract"]), vec!["HĐ 123"]);
     assert!(text(&kb, "hd", &["ex:Company"]).is_empty());
@@ -1291,8 +1298,8 @@ fn readers_find_new_events_through_head() {
         2
     );
 
-    // an event file written without HEAD (writer died in between): readers do not see it
-    // yet; the next write (which checks the files) repairs HEAD and indexes it
+    // an event file copied in by hand (HEAD not moved): neither readers nor writers list
+    // the folders, so nobody sees it until `sync --full` scans them
     let mut ev = kb.event(&second.event_id).unwrap();
     let late = ulid::Ulid::generate();
     ev.event_id = late.to_string();
@@ -1311,14 +1318,24 @@ fn readers_find_new_events_through_head() {
         )
     };
     assert_eq!(labels(&kb).len(), 2);
-    kb.assert(
-        &ops(
-            serde_json::json!([{"op": "add", "s": "_:z", "p": "rdf:type", "o": "ex:Company"},
-                                {"op": "add", "s": "_:z", "p": "rdfs:label", "o": "Zeta"}]),
-        ),
-        &opts(),
-    )
-    .unwrap();
+    assert_eq!(kb.sync().unwrap(), 0);
+    assert_eq!(kb.sync_full().unwrap(), 1);
+    assert_eq!(head(&events).trim(), late.to_string());
+    assert_eq!(labels(&kb).len(), 3);
+
+    // a writer that died after moving HEAD but before writing its event file: the next
+    // write finds HEAD on a missing file (one stat), repairs it and goes on
+    std::fs::write(events.join("HEAD"), format!("{}\n", ulid::Ulid::generate())).unwrap();
+    let zeta = kb
+        .assert(
+            &ops(
+                serde_json::json!([{"op": "add", "s": "_:z", "p": "rdf:type", "o": "ex:Company"},
+                                    {"op": "add", "s": "_:z", "p": "rdfs:label", "o": "Zeta"}]),
+            ),
+            &opts(),
+        )
+        .unwrap();
+    assert_eq!(head(&events).trim(), zeta.event_id);
     assert_eq!(labels(&kb).len(), 4, "{:?}", labels(&kb));
 
     // no HEAD (older KB): readers fall back to listing the files

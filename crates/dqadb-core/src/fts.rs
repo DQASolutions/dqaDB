@@ -201,8 +201,11 @@ impl Fts {
         offset: usize,
     ) -> Result<(Vec<(Id, f32)>, usize)> {
         let searcher = self.reader.searcher();
-        let mut parser = QueryParser::for_index(&self.index, vec![self.text]);
-        parser.set_conjunction_by_default();
+        // words are OR-ed, as in Lucene / Elasticsearch `match` / tantivy: BM25 ranks
+        // documents with more (and rarer) query words first. AND-ing them drops every
+        // document missing one word of a question (BEIR SciFact nDCG@10: 0.02 vs 0.66).
+        // `a AND b`, `+a`, `"a b"` still require words.
+        let parser = QueryParser::for_index(&self.index, vec![self.text]);
         let (q, _errors) = parser.parse_query_lenient(&fold_query(query));
         let top = TopDocs::with_limit(limit.max(1))
             .and_offset(offset)

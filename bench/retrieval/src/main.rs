@@ -237,7 +237,7 @@ fn eval(dataset: &Path, kb_dir: &Path) {
             }),
         ),
         (
-            "full-text (all words, dqaDB default)",
+            "full-text (raw query, dqaDB default)",
             Box::new(|q: &str| SearchQuery {
                 text: Some(q.to_string()),
                 limit: 100,

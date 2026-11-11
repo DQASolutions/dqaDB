@@ -215,12 +215,13 @@ pub fn list_after(events_dir: &Path, after: Option<Ulid>) -> Result<Vec<(Ulid, P
     Ok(out)
 }
 
-/// Newest event id on disk (scans only the newest non-empty day).
 /// `events/HEAD`: the newest event's ULID, written by the writer (under the write lock)
-/// right after each event file, so readers learn whether anything is new by reading one
-/// small file instead of listing the newest day directory (Lucene finds its current
-/// commit through `segments_N` the same way). Writers check it against the files and
-/// repair it; it can lag only if a writer died between the event file and HEAD.
+/// just before each event file, so readers and writers learn whether anything is new by
+/// reading one small file instead of listing the newest day directory (Lucene finds its
+/// current commit through `segments_N`, git through refs, the same way). Per-command cost
+/// thus does not grow with the number of events. A writer that died between HEAD and the
+/// file leaves HEAD on a missing file, repaired by the next writer (`head_checked`).
+/// Event files copied in by hand do not move HEAD: `dqadb sync --full` scans for them.
 pub const HEAD_FILE: &str = "HEAD";
 
 /// Newest event as recorded in HEAD; without a readable HEAD (older KBs, events copied
@@ -247,6 +248,21 @@ pub fn write_head(events_dir: &Path, id: Ulid) -> Result<()> {
     }
     fs::rename(&tmp, events_dir.join(HEAD_FILE))?;
     Ok(())
+}
+
+/// The newest event for a writer (callers hold the write lock), without listing the
+/// event directories: HEAD, checked with one `stat` that its event file exists.
+/// Writers point HEAD at an event before writing the file (see `Kb::commit`), so a
+/// writer that died in between leaves HEAD on a missing file; only then, or without a
+/// readable HEAD, are the files scanned and HEAD repaired.
+pub fn head_checked(events_dir: &Path) -> Result<Option<Ulid>> {
+    let recorded = fs::read_to_string(events_dir.join(HEAD_FILE))
+        .ok()
+        .and_then(|s| parse_ulid(s.trim()).ok());
+    match recorded {
+        Some(id) if events_dir.join(rel_path(id)).exists() => Ok(Some(id)),
+        _ => repair_head(events_dir),
+    }
 }
 
 /// Make HEAD match the newest event file (callers hold the write lock); returns it.

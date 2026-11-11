@@ -10,7 +10,7 @@ Modes:
 | mode | query |
 |---|---|
 | full-text BM25 (any word) | the query's words joined with `OR` (as the BM25 baselines do) |
-| full-text (all words) | the raw query; dqaDB's default joins words with AND |
+| full-text (raw query) | the query as typed: dqaDB's default (any word, BM25; AND until 2026-11-11) |
 | semantic | bge-m3 (ONNX, CLS, cosine) over the HNSW segments |
 | hybrid | RRF of the any-word BM25 and semantic rankings (`--text-mode fuse`) |
 
@@ -28,7 +28,8 @@ $B eval beir/scifact-912 work/scifact-912
 | | nDCG@10 | Recall@100 |
 |---|---|---|
 | dqaDB full-text, any word | **0.661** | 0.889 |
-| dqaDB full-text, all words (default) | 0.018 | 0.018 |
+| dqaDB full-text, raw query (default since 2026-11-11) | 0.651 | 0.874 |
+| dqaDB full-text, all words (the old default) | 0.018 | 0.018 |
 | Pyserini BM25 flat (BEIR leaderboard) | 0.679 | |
 | Pyserini BM25 multifield | 0.665 | |
 
@@ -43,7 +44,8 @@ compare the rows with each other, not with the full-corpus numbers.
 | | nDCG@10 | Recall@100 | ms/query |
 |---|---|---|---|
 | full-text, any word | 0.796 | 0.945 | 2 |
-| full-text, all words (default) | 0.036 | 0.036 | 1 |
+| full-text, raw query (default) | 0.804 | 0.945 | 2 |
+| full-text, all words (old default) | 0.036 | 0.036 | 1 |
 | semantic (bge-m3) | 0.735 | 0.982 | 404 |
 | hybrid (RRF) | **0.811** | **0.982** | 333 |
 
@@ -54,9 +56,12 @@ Semantic query time is the bge-m3 query embedding on this CPU, not the index.
 - **Bug, fixed:** `fold()` lower-cased the whole query, so `a OR b` searched for the word
   "or" (OR behaved as AND). Operators `AND` / `OR` / `NOT` now stay as they are
   (`fts::fold_query`), as in Lucene / tantivy syntax.
-- **AND by default is wrong for natural-language queries** (0.018): a long question
-  rarely has every word in one abstract. Fine for short keyword lookups by an agent, but
-  questions should use OR (BM25 ranks docs with more and rarer words first).
+- **AND by default was wrong for natural-language queries** (0.018): a long question
+  rarely has every word in one abstract. Changed to any word, ranked by BM25, as in
+  Lucene / Elasticsearch `match` / Solr / tantivy (Meilisearch: all words first, then
+  drops words). Words can still be required: `a AND b`, `+a`, `"a b"`. The raw query is
+  0.01 below the bare-words query because characters like `-` and `:` in a question are
+  read as query syntax.
 - **Hybrid > either alone** on the subset (+0.015 over BM25, +0.076 over semantic),
   as in the BEIR / Qdrant hybrid results. With 55 queries the difference between
   full-text and hybrid is within noise; the semantic gap is not.

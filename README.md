@@ -43,7 +43,7 @@ dqadb events ls
 rm -rf .dqadb && dqadb rebuild   # same fingerprint as before
 ```
 
-`events/HEAD` names the newest event; writers update it after each event file and repair it from the files, readers use it to see whether the index is behind without listing event directories. After copying event files in by hand, run any write or `dqadb rebuild`.
+`events/HEAD` names the newest event (the commit point, like Lucene's `segments_N` or a git ref). Writers move it just before writing each event file; readers and writers read it instead of listing event directories, so a command costs the same at 2k or 1M events (a write at 21k same-day events: 12 ms, was 73 ms when writers listed the newest day). A writer that died between HEAD and its file is repaired by the next one (one `stat`). After copying event files in by hand, run `dqadb sync --full`; events older than the index watermark need `dqadb rebuild`.
 
 `import` validates the whole file against the ontology before writing anything (issues are counted per kind, with the first triple that has each), copies the file into `sources/` once, and writes the triples as events of 50,000 (`--batch`) that all point to it. Blank nodes become new `dqadb:` entities; triples in named graphs are refused (dqaDB's named graphs are its events). Required slots are checked over the whole file, so an entity's type and label may sit in different batches.
 
@@ -63,7 +63,8 @@ The derived index is a single SQLite file, `.dqadb/index.sqlite` (WAL mode). SQL
 ## Full-text search
 
 ```bash
-dqadb search --text "hai phong"                       # accents and đ/d ignored
+dqadb search --text "hai phong"                       # accents and đ/d ignored; any word, best BM25 first
+dqadb search --text "hai AND phong"                   # require words (AND, +word, "a phrase")
 dqadb search --text "vận tải" --type ex:Company --where 'ex:country = "VN"'
 ```
 

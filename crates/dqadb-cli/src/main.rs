@@ -49,6 +49,12 @@ enum Cmd {
     },
     /// Counts, watermark, and whether the index is in sync with the event files
     Status,
+    /// Apply new events to the index (every command does this by reading events/HEAD).
+    /// --full also scans the event folders, for event files copied in by hand
+    Sync {
+        #[arg(long)]
+        full: bool,
+    },
     /// Delete and rebuild the derived index (.dqadb/) from events
     Rebuild,
     /// Check every event file (parse, name, sharded path)
@@ -184,7 +190,8 @@ enum Cmd {
         /// Field filter; repeatable (AND)
         #[arg(long = "where")]
         wheres: Vec<String>,
-        /// Full-text query, ranked by BM25 (accents and đ/d ignored)
+        /// Full-text query, ranked by BM25 (accents and đ/d ignored). Any word matches,
+        /// documents with more of them rank first; require words with AND, +word or "a phrase"
         #[arg(long)]
         text: Option<String>,
         /// How --text combines with --semantic: must (text required, ranked by meaning)
@@ -592,6 +599,13 @@ fn run(cli: Cli) -> Result<()> {
 
     match cli.cmd {
         Cmd::Init { .. } | Cmd::Model(_) => unreachable!(),
+        Cmd::Sync { full } => {
+            let n = if full { kb.sync_full()? } else { kb.sync()? };
+            if json {
+                return print_json(&serde_json::json!({ "applied_events": n }));
+            }
+            println!("applied {n} event(s)");
+        }
         Cmd::Status => {
             let s = kb.status()?;
             if json {

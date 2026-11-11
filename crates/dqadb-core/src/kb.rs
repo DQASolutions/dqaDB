@@ -302,13 +302,31 @@ impl Kb {
         Ok(n)
     }
 
+    /// `sync` after a full scan of the event files: picks up event files copied in
+    /// without updating events/HEAD (normal writes keep HEAD current, so `sync` only
+    /// reads HEAD). Events older than the index watermark need `dqadb rebuild`.
+    pub fn sync_full(&self) -> Result<usize> {
+        let store = self.store()?;
+        let inference = self.ontology()?.inference();
+        let _lock = self.lock()?;
+        event::repair_head(&self.events_dir())?;
+        let n = self.sync_locked(&store, &inference)?;
+        self.write_manifest(&store, None)?;
+        Ok(n)
+    }
+
     pub(crate) fn sync_locked(&self, store: &Store, inference: &Inference) -> Result<usize> {
         let (wm, rules) = {
             let r = store.read()?;
             (r.watermark()?, r.inference_hash()?)
         };
-        let files = event::list_after(&self.events_dir(), wm)?;
-        event::repair_head(&self.events_dir())?;
+        // HEAD says whether there is anything newer; only then are the files listed
+        let head = event::head_checked(&self.events_dir())?;
+        let files = if head > wm {
+            event::list_after(&self.events_dir(), wm)?
+        } else {
+            Vec::new()
+        };
         if files.is_empty() && rules.as_deref() != Some(inference.hash.as_str()) {
             // ontology hierarchy changed: opening a batch recomputes inferences
             store.batch(inference)?.commit()?;
@@ -558,7 +576,7 @@ impl Kb {
     }
 
     fn check_expected(&self, opts: &WriteOpts) -> Result<Option<Ulid>> {
-        let latest = event::repair_head(&self.events_dir())?;
+        let latest = event::head_checked(&self.events_dir())?;
         if let Some(exp) = &opts.expected_version {
             let actual = latest.map(|u| u.to_string()).unwrap_or_default();
             if *exp != actual {
@@ -600,8 +618,16 @@ impl Kb {
             note: opts.note.clone(),
             ops,
         };
-        let path = event::write_atomic(&self.events_dir(), &ev)?;
+        // HEAD first: if the event file then fails, HEAD points at a missing file, which
+        // the next writer notices with one stat (`event::head_checked`) and repairs
         event::write_head(&self.events_dir(), id)?;
+        let path = match event::write_atomic(&self.events_dir(), &ev) {
+            Ok(p) => p,
+            Err(e) => {
+                let _ = event::repair_head(&self.events_dir());
+                return Err(e);
+            }
+        };
         // The event is durable now; if indexing fails, the next command catches up.
         let stats = batch.apply(&ev)?;
         batch.commit()?;
