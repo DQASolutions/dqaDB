@@ -4,6 +4,7 @@
 //! Modes:
 //!   load <dataset dir> <kb dir>     corpus.jsonl -> fresh dqaDB KB (title + text), embedded
 //!   eval <dataset dir> <kb dir>     test queries in each search mode; prints the metrics
+//!   (--text-only: skip embedding / the semantic and hybrid modes)
 //!   subset <dataset dir> <out dir> <n>
 //!                                   the first n corpus docs, and the test queries whose
 //!                                   relevant docs are all among them (a quick run on a
@@ -63,7 +64,7 @@ fn doc_iri(id: &str) -> String {
     s
 }
 
-fn load(dataset: &Path, kb_dir: &Path) {
+fn load(dataset: &Path, kb_dir: &Path, text_only: bool) {
     // a fresh KB, but the embedding cache (content-addressed) is kept: vectors are slow
     // to compute on a CPU and the same texts embed the same
     let cache = kb_dir.join("emb-cache");
@@ -122,6 +123,9 @@ fn load(dataset: &Path, kb_dir: &Path) {
         r.triples,
         t.elapsed().as_secs_f64()
     );
+    if text_only {
+        return;
+    }
     let t = Instant::now();
     let e = kb.embed(false).unwrap();
     eprintln!(
@@ -193,7 +197,7 @@ fn any_words(q: &str) -> String {
         .join(" OR ")
 }
 
-fn eval(dataset: &Path, kb_dir: &Path) {
+fn eval(dataset: &Path, kb_dir: &Path, text_only: bool) {
     let kb = Kb::open(kb_dir).unwrap();
     let qrels = qrels(&dataset.join("test.tsv"));
     let queries: HashMap<String, String> = jsonl(&dataset.join("queries.jsonl"))
@@ -264,7 +268,7 @@ fn eval(dataset: &Path, kb_dir: &Path) {
         ),
     ];
     println!("{} test queries", qrels.len());
-    for (name, make) in &modes {
+    for (name, make) in modes.iter().take(if text_only { 2 } else { 4 }) {
         let t = Instant::now();
         let (mut ndcg, mut rec, mut n) = (0.0, 0.0, 0usize);
         for (qid, rel) in &qrels {
@@ -329,11 +333,13 @@ fn subset(dataset: &Path, out: &Path, n: usize) {
 }
 
 fn main() {
-    let a: Vec<String> = std::env::args().collect();
+    // --text-only: no embeddings (load) / only the full-text modes (eval)
+    let text_only = std::env::args().any(|a| a == "--text-only");
+    let a: Vec<String> = std::env::args().filter(|a| a != "--text-only").collect();
     let p = |i: usize| PathBuf::from(&a[i]);
     match a.get(1).map(String::as_str) {
-        Some("load") => load(&p(2), &p(3)),
-        Some("eval") => eval(&p(2), &p(3)),
+        Some("load") => load(&p(2), &p(3), text_only),
+        Some("eval") => eval(&p(2), &p(3), text_only),
         Some("subset") => subset(&p(2), &p(3), a[4].parse().unwrap()),
         _ => {
             eprintln!(

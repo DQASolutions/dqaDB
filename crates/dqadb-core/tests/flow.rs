@@ -1489,3 +1489,63 @@ fn sparql_protocol_requests_and_content_negotiation() {
     );
     assert_eq!(r.status, 405);
 }
+
+#[test]
+fn full_text_bigrams_and_slot_weights_rank() {
+    use dqadb_core::search::SearchQuery;
+    let (dir, kb) = new_kb();
+    kb.assert(
+        &ops(serde_json::json!([
+            {"op": "add", "s": "_:a", "p": "rdf:type", "o": "ex:Company"},
+            {"op": "add", "s": "_:a", "p": "rdfs:label", "o": "Alpha"},
+            {"op": "add", "s": "_:a", "p": "ex:description", "o": "Đồng bộ dữ liệu và hợp nhất kho"},
+            {"op": "add", "s": "_:b", "p": "rdf:type", "o": "ex:Company"},
+            {"op": "add", "s": "_:b", "p": "rdfs:label", "o": "Beta"},
+            {"op": "add", "s": "_:b", "p": "ex:description", "o": "Ký hợp đồng vận tải kho bãi lớn nhất miền Bắc"},
+            {"op": "add", "s": "_:e", "p": "rdf:type", "o": "ex:Company"},
+            {"op": "add", "s": "_:e", "p": "rdfs:label", "o": "Gamma"},
+            {"op": "add", "s": "_:e", "p": "ex:description", "o": "logistics"},
+            {"op": "add", "s": "_:f", "p": "rdf:type", "o": "ex:Company"},
+            {"op": "add", "s": "_:f", "p": "rdfs:label", "o": "Logistics Xanh"},
+            {"op": "add", "s": "_:f", "p": "ex:description", "o": "dịch vụ giao nhận hàng hóa toàn quốc"}
+        ])),
+        &opts(),
+    )
+    .unwrap();
+    let text = |kb: &Kb, t: &str| -> Vec<String> {
+        kb.search(&SearchQuery {
+            text: Some(t.into()),
+            limit: 10,
+            ..Default::default()
+        })
+        .unwrap()
+        .hits
+        .into_iter()
+        .filter_map(|h| h.label)
+        .collect()
+    };
+    // both have "hop" and "dong"; Beta has them as the word "hợp đồng" (a bigram) and
+    // ranks first although its text is longer; bigrams do not change what matches
+    assert_eq!(text(&kb, "hợp đồng"), vec!["Beta", "Alpha"]);
+    assert_eq!(text(&kb, "dong hop"), vec!["Alpha", "Beta"]);
+
+    // slot weights: the short description wins until labels weigh 4x (fts^4)
+    assert_eq!(text(&kb, "logistics"), vec!["Gamma", "Logistics Xanh"]);
+    let schema = dir.path().join("ontology/schema.linkml.yaml");
+    let yaml = std::fs::read_to_string(&schema).unwrap();
+    std::fs::write(
+        &schema,
+        yaml.replacen("dqadb_index: fts,card", "dqadb_index: fts^4,card", 1),
+    )
+    .unwrap();
+    kb.build_ontology(true).unwrap();
+    assert_eq!(text(&kb, "logistics"), vec!["Logistics Xanh", "Gamma"]);
+    // a weight below 1 is refused with the reason
+    std::fs::write(
+        &schema,
+        yaml.replacen("dqadb_index: fts,card", "dqadb_index: fts^0.5,card", 1),
+    )
+    .unwrap();
+    let err = kb.build_ontology(true).unwrap_err().to_string();
+    assert!(err.contains(">= 1"), "{err}");
+}

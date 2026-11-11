@@ -393,10 +393,11 @@ impl Kb {
     /// The full-text projection, caught up with the SQLite index (spec §11).
     /// Fast path: its commit payload already matches, no lock taken.
     pub(crate) fn fts_ready(&self, store: &Store, onto: &Ontology) -> Result<Fts> {
-        let fts = Fts::open_or_create(&fts::dir(&self.index_dir()))?;
+        let preds = fts_predicates(onto);
+        let fts = Fts::open_or_create(&fts::dir(&self.index_dir()), &fts::weights(&preds))?;
         let want = FtsState {
             watermark: store.read()?.watermark()?.map(|u| u.to_string()),
-            config: fts::config_hash(&fts_predicates(onto)),
+            config: fts::config_hash(&preds),
         };
         if fts.state()?.as_ref() == Some(&want) {
             return Ok(fts);
@@ -409,8 +410,8 @@ impl Kb {
     /// Catch the text index up (caller holds the write lock). Returns the index and the
     /// number of documents written.
     fn fts_locked(&self, store: &Store, onto: &Ontology) -> Result<(Fts, usize)> {
-        let fts = Fts::open_or_create(&fts::dir(&self.index_dir()))?;
         let preds = fts_predicates(onto);
+        let fts = Fts::open_or_create(&fts::dir(&self.index_dir()), &fts::weights(&preds))?;
         let r = store.read()?;
         let wm = r.watermark()?;
         let want = FtsState {
@@ -423,9 +424,9 @@ impl Kb {
             return Ok((fts, 0));
         }
         let mut pred_ids = Vec::new();
-        for p in &preds {
+        for (p, w) in &preds {
             if let Some(id) = r.term_id(&Term::Iri(p.clone()))? {
-                pred_ids.push(id);
+                pred_ids.push((id, *w));
             }
         }
         let have_wm = have
@@ -435,7 +436,7 @@ impl Kb {
             .transpose()?;
         let incremental = have.as_ref().is_some_and(|h| h.config == want.config) && have_wm <= wm;
         let n = if incremental {
-            let names: HashSet<String> = preds.into_iter().collect();
+            let names: HashSet<String> = preds.into_iter().map(|p| p.0).collect();
             let touched = fts::touched_subjects(&r, &self.events_dir(), have_wm, wm, &names)?;
             fts.update(&r, &touched, &pred_ids, &want)?
         } else {
@@ -919,14 +920,15 @@ fn replay(store: &Store, files: &[(Ulid, PathBuf)], inference: &Inference) -> Re
 }
 
 /// Predicates whose literals go into the full-text index (`dqadb_index: fts`).
-fn fts_predicates(onto: &Ontology) -> Vec<String> {
-    let mut v: Vec<String> = onto
+/// Full-text predicates with their weights (`dqadb_index: fts^2`), by IRI.
+fn fts_predicates(onto: &Ontology) -> Vec<(String, f32)> {
+    let mut v: Vec<(String, f32)> = onto
         .slots
         .values()
         .filter(|s| s.index.iter().any(|i| i == "fts"))
-        .map(|s| s.iri.clone())
+        .map(|s| (s.iri.clone(), s.fts_boost))
         .collect();
-    v.sort();
+    v.sort_by(|a, b| a.0.cmp(&b.0));
     v
 }
 

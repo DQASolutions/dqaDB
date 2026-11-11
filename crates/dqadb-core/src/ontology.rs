@@ -98,8 +98,15 @@ pub struct SlotDef {
     pub required: bool,
     pub multivalued: bool,
     pub index: Vec<String>,
+    /// full-text weight, from `dqadb_index: fts^2` (Lucene / Solr `qf` boost syntax)
+    #[serde(skip_serializing_if = "is_one")]
+    pub fts_boost: f32,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+}
+
+fn is_one(x: &f32) -> bool {
+    *x == 1.0
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -333,17 +340,29 @@ impl Ontology {
 
         let make_slot = |name: &str, def: &LmSlot| -> Result<SlotDef> {
             let range = resolve_range(def.range.as_deref().unwrap_or(&default_range))?;
-            let index = def
-                .annotations
-                .get("dqadb_index")
-                .and_then(annotation_text)
-                .map(|t| {
-                    t.split(',')
-                        .map(|x| x.trim().to_string())
-                        .filter(|x| !x.is_empty())
-                        .collect()
-                })
-                .unwrap_or_default();
+            let mut fts_boost = 1.0f32;
+            let mut index: Vec<String> = Vec::new();
+            let text = def.annotations.get("dqadb_index").and_then(annotation_text);
+            for x in text.iter().flat_map(|t| t.split(',')).map(str::trim) {
+                match x.split_once('^') {
+                    Some((kind, w)) => {
+                        let w: f32 = w.trim().parse().ok().filter(|w: &f32| *w >= 1.0).ok_or_else(|| {
+                            Error::other(format!(
+                                "slot {name}: dqadb_index '{x}': the weight after ^ must be a number >= 1 (1 = like the other fts slots)"
+                            ))
+                        })?;
+                        if kind.trim() != "fts" {
+                            return Err(Error::other(format!(
+                                "slot {name}: dqadb_index '{x}': only fts takes a weight (fts^2)"
+                            )));
+                        }
+                        fts_boost = w;
+                        index.push("fts".into());
+                    }
+                    None if !x.is_empty() => index.push(x.to_string()),
+                    None => {}
+                }
+            }
             Ok(SlotDef {
                 name: name.to_string(),
                 iri: iri_of(&def.slot_uri, name)?,
@@ -351,6 +370,7 @@ impl Ontology {
                 required: def.required.unwrap_or(false),
                 multivalued: def.multivalued.unwrap_or(false),
                 index,
+                fts_boost,
                 description: def.description.clone(),
             })
         };
@@ -418,6 +438,7 @@ impl Ontology {
                 required: false,
                 multivalued: true,
                 index: index.split(',').map(str::to_string).collect(),
+                fts_boost: 1.0,
                 description: None,
             });
         }
