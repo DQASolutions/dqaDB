@@ -1549,3 +1549,39 @@ fn full_text_bigrams_and_slot_weights_rank() {
     let err = kb.build_ontology(true).unwrap_err().to_string();
     assert!(err.contains(">= 1"), "{err}");
 }
+
+#[test]
+fn sparql_compares_dates_like_oxigraph() {
+    // xsd:date ordering is SPARQL extension SEP-0002, on in Oxigraph; without it every
+    // `?d < "..."^^xsd:date` filter silently matched nothing
+    let (_dir, kb) = new_kb();
+    let q = |f: &str| {
+        select(
+            &kb,
+            &format!(
+                "PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+                 SELECT ?x WHERE {{ BIND(\"2016-07-01\"^^xsd:date AS ?x) FILTER({f}) }}"
+            ),
+        )
+        .len()
+    };
+    assert_eq!(q("?x < \"2026-01-01\"^^xsd:date"), 1);
+    assert_eq!(q("?x > \"2026-01-01\"^^xsd:date"), 0);
+    assert_eq!(q("xsd:date(\"2016-07-01\") = ?x"), 1);
+    assert_eq!(q("?x - \"2016-06-30\"^^xsd:date = \"P1D\"^^xsd:dayTimeDuration"), 1);
+}
+
+#[test]
+fn full_text_takes_pasted_text_with_colons() {
+    use dqadb_core::search::SearchQuery;
+    let (_dir, kb) = new_kb();
+    kb.assert(&acme(), &opts()).unwrap();
+    let page = kb
+        .search(&SearchQuery {
+            text: Some("Tài sản gồm: ACME, text:x và http://a.b".into()),
+            limit: 5,
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(page.hits.len(), 1);
+}

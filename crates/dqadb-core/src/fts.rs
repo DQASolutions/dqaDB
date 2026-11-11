@@ -61,6 +61,10 @@ pub fn fold(s: &str) -> String {
 /// `fold` for a query: the words are folded, but the operators AND / OR / NOT stay
 /// upper case (Lucene / tantivy syntax), else `a OR b` would search for the word "or".
 pub fn fold_query(q: &str) -> String {
+    // `word:` would be tantivy's field syntax, and the fields are internal (text, w0..,
+    // bi): "gom: ..." in a pasted text failed with "field does not exist". A colon is a
+    // word separator here.
+    let q = q.replace(':', " ");
     q.split_inclusive(char::is_whitespace)
         .map(|w| match w.trim_end() {
             "AND" | "OR" | "NOT" => w.to_string(),
@@ -429,6 +433,7 @@ mod tests {
         assert_eq!(fold_query("Đà Nẵng OR Huế"), "da nang OR hue");
         assert_eq!(fold_query("a AND NOT B"), "a AND NOT b");
         assert_eq!(fold_query("Oregon or ORe"), "oregon or ore");
+        assert_eq!(fold_query("gom: Hà Nội"), "gom  ha noi");
     }
 
     #[test]
