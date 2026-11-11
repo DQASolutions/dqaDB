@@ -267,10 +267,22 @@ fn eval(dataset: &Path, kb_dir: &Path, text_only: bool) {
             }),
         ),
     ];
+    // optional second phrasing per query (ALQAC case facts): searched separately and
+    // fused with the question by RRF (k = 60), as kb does with several phrasings
+    let facts: HashMap<String, String> = jsonl(&dataset.join("queries.jsonl"))
+        .into_iter()
+        .filter_map(|q| {
+            Some((
+                q["_id"].as_str()?.to_string(),
+                q["fact"].as_str()?.to_string(),
+            ))
+        })
+        .collect();
     println!("{} test queries", qrels.len());
     for (name, make) in modes.iter().take(if text_only { 2 } else { 4 }) {
         let t = Instant::now();
         let (mut ndcg, mut rec, mut n) = (0.0, 0.0, 0usize);
+        let (mut r10, mut r20, mut mrr) = (0.0, 0.0, 0.0);
         for (qid, rel) in &qrels {
             let Some(text) = queries.get(qid) else {
                 continue;
@@ -291,15 +303,72 @@ fn eval(dataset: &Path, kb_dir: &Path, text_only: bool) {
                 .collect();
             ndcg += ndcg_at(10, &ranked, rel);
             rec += recall_at(100, &ranked, rel);
+            r10 += recall_at(10, &ranked, rel);
+            r20 += recall_at(20, &ranked, rel);
+            if let Some(i) = ranked.iter().position(|d| rel.get(d).is_some_and(|r| *r > 0.0)) {
+                mrr += 1.0 / (i + 1) as f64;
+            }
             n += 1;
         }
         println!(
-            "  {name:38} nDCG@10 {:.3}  Recall@100 {:.3}  ({:.0} ms/query)",
+            "  {name:38} nDCG@10 {:.3}  Recall@100 {:.3}  R@10 {:.3}  R@20 {:.3}  MRR {:.3}  ({:.0} ms/query)",
             ndcg / n as f64,
             rec / n as f64,
+            r10 / n as f64,
+            r20 / n as f64,
+            mrr / n as f64,
             t.elapsed().as_secs_f64() * 1e3 / n as f64
         );
     }
+    if facts.is_empty() {
+        return;
+    }
+    let search = |text: &str| -> Vec<String> {
+        kb.search(&SearchQuery {
+            text: Some(text.to_string()),
+            limit: 100,
+            ..Default::default()
+        })
+        .map(|p| p.hits.iter().map(|h| to_id(&h.iri)).collect())
+        .unwrap_or_default()
+    };
+    let (mut ndcg, mut rec, mut r10, mut r20, mut mrr, mut n) = (0.0, 0.0, 0.0, 0.0, 0.0, 0usize);
+    for (qid, rel) in &qrels {
+        let (Some(q), Some(f)) = (queries.get(qid), facts.get(qid)) else {
+            continue;
+        };
+        let ranked = rrf(&[search(q), search(f)]);
+        ndcg += ndcg_at(10, &ranked, rel);
+        rec += recall_at(100, &ranked, rel);
+        r10 += recall_at(10, &ranked, rel);
+        r20 += recall_at(20, &ranked, rel);
+        if let Some(i) = ranked.iter().position(|d| rel.get(d).is_some_and(|r| *r > 0.0)) {
+            mrr += 1.0 / (i + 1) as f64;
+        }
+        n += 1;
+    }
+    let n = n.max(1) as f64;
+    println!(
+        "  {:38} nDCG@10 {:.3}  Recall@100 {:.3}  R@10 {:.3}  R@20 {:.3}  MRR {:.3}",
+        "full-text, question + fact (RRF)",
+        ndcg / n,
+        rec / n,
+        r10 / n,
+        r20 / n,
+        mrr / n
+    );
+}
+
+fn rrf(lists: &[Vec<String>]) -> Vec<String> {
+    let mut score: HashMap<&String, f64> = HashMap::new();
+    for l in lists {
+        for (i, d) in l.iter().enumerate() {
+            *score.entry(d).or_default() += 1.0 / (60.0 + i as f64 + 1.0);
+        }
+    }
+    let mut v: Vec<(&String, f64)> = score.into_iter().collect();
+    v.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(b.0)));
+    v.into_iter().map(|(d, _)| d.clone()).collect()
 }
 
 fn subset(dataset: &Path, out: &Path, n: usize) {

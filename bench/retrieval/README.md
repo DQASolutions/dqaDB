@@ -83,6 +83,20 @@ top for Vietnamese at no cost in English. The full-text index grows ~3.6x (bigra
 59 MB for the 61k articles vs 506 MB for the SQLite index). ~20 ms per query at 61k
 articles on this laptop. Sweeps: `DQADB_BIGRAM_BOOST=<x>` overrides the weight.
 
+**ALQAC 2026 task 1 (the 18 Vietnamese laws kb ingests: 3,352 articles; 50 case
+questions with their gold articles), full-text only.** Gold articles are often procedural
+(court fees, Civil Procedure Code) and share few words with the case: hard lexically for
+both systems. kb = art-ws `score-retrieval.ts`, run a26b (LanceDB, 2026-11-11), which
+searches the question and the case facts together; 50 questions, so differences of a
+few hundredths are noise.
+
+| | R@10 | R@20 | MRR | nDCG@10 |
+|---|---|---|---|---|
+| kb (LanceDB), question + facts | **0.065** | **0.090** | 0.106 | |
+| dqaDB, question | 0.040 | 0.076 | **0.141** | 0.053 |
+| dqaDB, question + facts (RRF of two searches) | 0.035 | 0.072 | 0.124 | 0.045 |
+| dqaDB, question and facts as one query | 0.014 | 0.029 | 0.040 | 0.017 |
+
 ## What this found
 
 - **Bug, fixed:** `fold()` lower-cased the whole query, so `a OR b` searched for the word
