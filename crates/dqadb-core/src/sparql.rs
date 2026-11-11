@@ -32,6 +32,17 @@ pub struct KbDataset<'a> {
     reader: &'a Reader<'a>,
     event_ns: &'a str,
     events_dir: &'a Path,
+    cache: &'a TermCache,
+}
+
+/// Decoded terms for the duration of one query (FILTER, ORDER BY and joins decode the
+/// same ids again and again; each decode is a dictionary lookup). Jena TDB keeps a
+/// NodeId -> Node cache for the same reason. Ids are stable while the reader's snapshot
+/// lives, so the cache needs no invalidation.
+#[derive(Default)]
+pub struct TermCache {
+    terms: std::cell::RefCell<std::collections::HashMap<Id, OxTerm>>,
+    values: std::cell::RefCell<std::collections::HashMap<Id, spareval::ExpressionTerm>>,
 }
 
 type Quads<'a> = Box<dyn Iterator<Item = Result<InternalQuad<DTerm>>> + 'a>;
@@ -66,12 +77,27 @@ pub fn from_ox(t: &OxTerm) -> Option<Term> {
 }
 
 impl<'a> KbDataset<'a> {
-    pub fn new(reader: &'a Reader<'a>, event_ns: &'a str, events_dir: &'a Path) -> Self {
+    pub fn new(
+        reader: &'a Reader<'a>,
+        event_ns: &'a str,
+        events_dir: &'a Path,
+        cache: &'a TermCache,
+    ) -> Self {
         Self {
             reader,
             event_ns,
             events_dir,
+            cache,
         }
+    }
+
+    fn decode(&self, id: Id) -> Result<OxTerm> {
+        if let Some(t) = self.cache.terms.borrow().get(&id) {
+            return Ok(t.clone());
+        }
+        let t = to_ox(&self.reader.term(id)?);
+        self.cache.terms.borrow_mut().insert(id, t.clone());
+        Ok(t)
     }
 
     /// Triples of the default graph matching a pattern of dictionary ids.
@@ -216,9 +242,21 @@ impl<'a> QueryableDataset<'a> for KbDataset<'a> {
         })
     }
 
+    fn externalize_expression_term(&self, term: DTerm) -> Result<spareval::ExpressionTerm> {
+        let DTerm::Id(id) = term else {
+            return Ok(self.externalize_term(term)?.into());
+        };
+        if let Some(v) = self.cache.values.borrow().get(&id) {
+            return Ok(v.clone());
+        }
+        let v: spareval::ExpressionTerm = self.decode(id)?.into();
+        self.cache.values.borrow_mut().insert(id, v.clone());
+        Ok(v)
+    }
+
     fn externalize_term(&self, term: DTerm) -> Result<OxTerm> {
         Ok(match term {
-            DTerm::Id(id) => to_ox(&self.reader.term(id)?),
+            DTerm::Id(id) => self.decode(id)?,
             DTerm::Event(e) => NamedNode::new_unchecked(format!("{}{e}", self.event_ns)).into(),
             DTerm::Ext(t) => t,
         })

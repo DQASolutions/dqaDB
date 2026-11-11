@@ -247,6 +247,11 @@ impl Cache {
         let fresh = !path.exists();
         let conn = Connection::open(&path)?;
         conn.busy_timeout(Duration::from_secs(30))?;
+        // keep cached statements prepared (see store.rs: STAT4 + cleared bindings)
+        conn.set_db_config(
+            rusqlite::config::DbConfig::SQLITE_DBCONFIG_ENABLE_QPSG,
+            true,
+        )?;
         conn.execute_batch(
             "PRAGMA page_size=16384; PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;
              CREATE TABLE IF NOT EXISTS emb(id INTEGER PRIMARY KEY, key BLOB NOT NULL UNIQUE, vec BLOB NOT NULL);",

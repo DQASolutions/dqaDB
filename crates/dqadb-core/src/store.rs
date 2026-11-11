@@ -196,6 +196,49 @@ impl Perm {
     }
 }
 
+/// `SELECT a, b, c FROM <table> WHERE <prefix> [AND (a, b, c) > after] ORDER BY a, b, c
+/// LIMIT PAGE` for every table, bound-prefix length (0..=3) and paging state.
+fn page_sql(perm: Perm, bound: usize, after: bool) -> &'static str {
+    static SQL: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    let all = SQL.get_or_init(|| {
+        let mut out = Vec::new();
+        for perm in [Perm::Spo, Perm::Pos, Perm::Osp] {
+            for bound in 0..=3 {
+                for after in [false, true] {
+                    let cols = ["a", "b", "c"];
+                    let mut conds: Vec<String> = (0..bound)
+                        .map(|n| format!("{} = ?{}", cols[n], n + 1))
+                        .collect();
+                    if after {
+                        conds.push(format!(
+                            "(a, b, c) > (?{}, ?{}, ?{})",
+                            bound + 1,
+                            bound + 2,
+                            bound + 3
+                        ));
+                    }
+                    let filter = if conds.is_empty() {
+                        String::new()
+                    } else {
+                        format!("WHERE {}", conds.join(" AND "))
+                    };
+                    out.push(format!(
+                        "SELECT a, b, c FROM {} {filter} ORDER BY a, b, c LIMIT {PAGE}",
+                        perm.table()
+                    ));
+                }
+            }
+        }
+        out
+    });
+    let p = match perm {
+        Perm::Spo => 0,
+        Perm::Pos => 1,
+        Perm::Osp => 2,
+    };
+    &all[p * 8 + bound * 2 + after as usize]
+}
+
 fn i(id: Id) -> i64 {
     id as i64
 }
@@ -223,6 +266,16 @@ fn connect(path: &Path, bulk: bool) -> Result<Connection> {
             | OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )?;
     conn.busy_timeout(BUSY_TIMEOUT)?;
+    // Query planner stability guarantee. The bundled SQLite has STAT4, so statements
+    // whose plan could depend on a bound value are marked for re-prepare, and
+    // rusqlite's statement cache clears bindings when a statement goes back to the cache:
+    // every reuse of a cached statement then recompiled it (~10 us of a 2 us lookup,
+    // 950 lookups per BSBM T5 query). The index never runs ANALYZE, so plans do not
+    // depend on bound values anyway; QPSG keeps the prepared plan.
+    conn.set_db_config(
+        rusqlite::config::DbConfig::SQLITE_DBCONFIG_ENABLE_QPSG,
+        true,
+    )?;
     // NORMAL in WAL mode: a power loss can drop the last commits of the *index*;
     // the events are already durable and the next command catches up from them.
     let sync = if bulk { "OFF" } else { "NORMAL" };
@@ -664,28 +717,14 @@ impl Reader<'_> {
     }
 
     fn page(&self, perm: Perm, prefix: &[Id], after: Option<Triple>) -> Result<Vec<Triple>> {
-        let cols = ["a", "b", "c"];
-        let mut conds: Vec<String> = prefix
-            .iter()
-            .enumerate()
-            .map(|(n, _)| format!("{} = ?{}", cols[n], n + 1))
-            .collect();
         let mut args: Vec<i64> = prefix.iter().map(|v| i(*v)).collect();
         if let Some((a, b, c)) = after {
-            let n = args.len();
-            conds.push(format!("(a, b, c) > (?{}, ?{}, ?{})", n + 1, n + 2, n + 3));
             args.extend([i(a), i(b), i(c)]);
         }
-        let filter = if conds.is_empty() {
-            String::new()
-        } else {
-            format!("WHERE {}", conds.join(" AND "))
-        };
-        let sql = format!(
-            "SELECT a, b, c FROM {} {filter} ORDER BY a, b, c LIMIT {PAGE}",
-            perm.table()
-        );
-        let mut st = self.conn.prepare_cached(&sql)?;
+        // the SQL text is built once per (table, bound prefix, paging) shape: a lookup is
+        // a cached-statement hit plus a B-tree seek, not string building (~3x faster)
+        let sql = page_sql(perm, prefix.len(), after.is_some());
+        let mut st = self.conn.prepare_cached(sql)?;
         let rows = st.query_map(rusqlite::params_from_iter(args), |r| {
             Ok((
                 r.get::<_, i64>(0)? as Id,

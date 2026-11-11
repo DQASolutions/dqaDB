@@ -418,6 +418,384 @@ fn compare(a: &Path, b: &Path) {
     }
 }
 
+/// Calls the engine makes into dqaDB's dataset for the queries of one template, and the
+/// time spent in each kind of call.
+mod counting {
+    use dqadb_core::sparql::{DTerm, KbDataset};
+    use spareval::{InternalQuad, QueryableDataset};
+    use std::cell::RefCell;
+    use std::time::Instant;
+
+    #[derive(Default, Debug)]
+    pub struct Stats {
+        pub patterns: usize,
+        pub quads: usize,
+        pub pattern_s: f64,
+        pub internalize: usize,
+        pub internalize_s: f64,
+        pub externalize: usize,
+        pub externalize_s: f64,
+        pub expr: usize,
+        pub expr_s: f64,
+    }
+
+    #[derive(Clone, Copy)]
+    pub struct Counting<'a> {
+        pub inner: KbDataset<'a>,
+        pub stats: &'a RefCell<Stats>,
+    }
+
+    impl<'a> QueryableDataset<'a> for Counting<'a> {
+        type InternalTerm = DTerm;
+        type Error = dqadb_core::Error;
+        fn internal_quads_for_pattern(
+            &self,
+            s: Option<&DTerm>,
+            p: Option<&DTerm>,
+            o: Option<&DTerm>,
+            g: Option<Option<&DTerm>>,
+        ) -> impl Iterator<Item = Result<InternalQuad<DTerm>, Self::Error>> + use<'a> {
+            let t = Instant::now();
+            let v: Vec<_> = self.inner.internal_quads_for_pattern(s, p, o, g).collect();
+            let mut st = self.stats.borrow_mut();
+            st.patterns += 1;
+            st.quads += v.len();
+            st.pattern_s += t.elapsed().as_secs_f64();
+            v.into_iter()
+        }
+        fn internalize_term(&self, term: oxrdf::Term) -> Result<DTerm, Self::Error> {
+            let t = Instant::now();
+            let r = self.inner.internalize_term(term);
+            let mut st = self.stats.borrow_mut();
+            st.internalize += 1;
+            st.internalize_s += t.elapsed().as_secs_f64();
+            r
+        }
+        fn externalize_term(&self, term: DTerm) -> Result<oxrdf::Term, Self::Error> {
+            let t = Instant::now();
+            let r = self.inner.externalize_term(term);
+            let mut st = self.stats.borrow_mut();
+            st.externalize += 1;
+            st.externalize_s += t.elapsed().as_secs_f64();
+            r
+        }
+        fn externalize_expression_term(
+            &self,
+            term: DTerm,
+        ) -> Result<spareval::ExpressionTerm, Self::Error> {
+            let t = Instant::now();
+            let r = self.inner.externalize_expression_term(term);
+            let mut st = self.stats.borrow_mut();
+            st.expr += 1;
+            st.expr_s += t.elapsed().as_secs_f64();
+            r
+        }
+    }
+}
+
+fn profile(dq: &Path, mix: &Path, template_id: usize) {
+    use spareval::{QueryEvaluator, QueryResults};
+    let kb = dqadb_core::Kb::open(dq).unwrap();
+    let store = dqadb_core::store::Store::open(&kb.index_dir().join("index.sqlite")).unwrap();
+    let r = store.read().unwrap();
+    let ns = kb.event_namespace();
+    let ev = kb.events_dir();
+    let mut templates: BTreeMap<String, usize> = BTreeMap::new();
+    let stats = std::cell::RefCell::new(counting::Stats::default());
+    let (mut n, mut total) = (0, 0.0);
+    for q in mix_queries(mix) {
+        let next = templates.len() + 1;
+        if *templates.entry(template(&q)).or_insert(next) != template_id {
+            continue;
+        }
+        let parsed = spargebra::SparqlParser::new().parse_query(&q).unwrap();
+        let cache = dqadb_core::sparql::TermCache::default();
+        let ds = counting::Counting {
+            inner: dqadb_core::sparql::KbDataset::new(&r, &ns, &ev, &cache),
+            stats: &stats,
+        };
+        let t = Instant::now();
+        let ev = QueryEvaluator::new();
+        match ev.prepare(&parsed).execute(ds).unwrap() {
+            QueryResults::Solutions(s) => {
+                s.for_each(|x| {
+                    x.unwrap();
+                });
+            }
+            QueryResults::Graph(g) => {
+                g.for_each(|x| {
+                    x.unwrap();
+                });
+            }
+            QueryResults::Boolean(_) => {}
+        }
+        total += t.elapsed().as_secs_f64();
+        n += 1;
+    }
+    let st = stats.borrow();
+    let per = |x: f64| x * 1e3 / n as f64;
+    println!("T{template_id}: {n} queries, {:.2} ms/query", per(total));
+    println!(
+        "  pattern lookups {:.0}/query ({:.0} quads) {:.2} ms",
+        st.patterns as f64 / n as f64,
+        st.quads as f64 / n as f64,
+        per(st.pattern_s)
+    );
+    println!(
+        "  internalize {:.0}/query {:.2} ms; externalize {:.0}/query {:.2} ms; expression terms {:.0}/query {:.2} ms",
+        st.internalize as f64 / n as f64,
+        per(st.internalize_s),
+        st.externalize as f64 / n as f64,
+        per(st.externalize_s),
+        st.expr as f64 / n as f64,
+        per(st.expr_s)
+    );
+    println!(
+        "  engine (the rest) {:.2} ms",
+        per(total - st.pattern_s - st.internalize_s - st.externalize_s - st.expr_s)
+    );
+}
+
+/// Cost of one bound-subject, bound-predicate lookup (the pattern most BSBM joins do),
+/// dqaDB's index scan vs Oxigraph's store, over every product's rdfs:label and
+/// productPropertyNumeric1.
+fn lookup(dq: &Path, ox: &Path) {
+    use dqadb_core::rdf::Term as DqTerm;
+    use oxigraph::model::{NamedNodeRef, TermRef};
+    let kb = dqadb_core::Kb::open(dq).unwrap();
+    let store = dqadb_core::store::Store::open(&kb.index_dir().join("index.sqlite")).unwrap();
+    let r = store.read().unwrap();
+    let oxs = oxigraph::store::Store::open(ox).unwrap();
+    let product = format!("{BSBM}Product");
+    let products: Vec<String> = oxs
+        .quads_for_pattern(
+            None,
+            Some(NamedNodeRef::new(RDF_TYPE).unwrap()),
+            Some(TermRef::NamedNode(NamedNodeRef::new(&product).unwrap())),
+            None,
+        )
+        .map(|q| {
+            q.unwrap()
+                .subject
+                .to_string()
+                .trim_matches(|c| c == '<' || c == '>')
+                .to_string()
+        })
+        .collect();
+    let preds = [
+        "http://www.w3.org/2000/01/rdf-schema#label".to_string(),
+        format!("{BSBM}productPropertyNumeric1"),
+    ];
+    let ids: Vec<(u64, u64)> = products
+        .iter()
+        .flat_map(|s| preds.iter().map(move |p| (s, p)))
+        .map(|(s, p)| {
+            (
+                r.term_id(&DqTerm::Iri(s.clone())).unwrap().unwrap(),
+                r.term_id(&DqTerm::Iri(p.clone())).unwrap().unwrap(),
+            )
+        })
+        .collect();
+    let reps = 20;
+    let t = Instant::now();
+    let mut n = 0;
+    for _ in 0..reps {
+        for (s, p) in &ids {
+            n += r.scan(Some(*s), Some(*p), None).count();
+        }
+    }
+    let dq_us = t.elapsed().as_secs_f64() * 1e6 / (reps * ids.len()) as f64;
+    let t = Instant::now();
+    let mut m = 0;
+    for _ in 0..reps {
+        for s in &products {
+            for p in &preds {
+                m += oxs
+                    .quads_for_pattern(
+                        Some(NamedNodeRef::new(s).unwrap().into()),
+                        Some(NamedNodeRef::new(p).unwrap()),
+                        None,
+                        None,
+                    )
+                    .count();
+            }
+        }
+    }
+    let ox_us = t.elapsed().as_secs_f64() * 1e6 / (reps * ids.len()) as f64;
+    println!("(s, p, ?) lookup: dqaDB {dq_us:.1} us ({n} hits), Oxigraph {ox_us:.1} us ({m} hits)");
+    let t = Instant::now();
+    for _ in 0..reps {
+        for (s, _) in &ids {
+            r.term(*s).unwrap();
+        }
+    }
+    // floor: the simplest SQLite point query on the same table, one prepared statement
+    let conn = rusqlite::Connection::open_with_flags(
+        kb.index_dir().join("index.sqlite"),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .unwrap();
+    for sql in [
+        "SELECT c FROM spo WHERE a = ?1 AND b = ?2",
+        "SELECT a, b, c FROM spo WHERE a = ?1 AND b = ?2 ORDER BY a, b, c LIMIT 1024",
+    ] {
+        let mut st = conn.prepare(sql).unwrap();
+        let t = Instant::now();
+        let mut k = 0;
+        for _ in 0..reps {
+            for (s, p) in &ids {
+                let mut rows = st.query([*s as i64, *p as i64]).unwrap();
+                while let Some(_r) = rows.next().unwrap() {
+                    k += 1;
+                }
+            }
+        }
+        println!(
+            "raw SQLite {sql:70}: {:.1} us ({k})",
+            t.elapsed().as_secs_f64() * 1e6 / (reps * ids.len()) as f64
+        );
+    }
+    {
+        let sql = "SELECT a, b, c FROM spo WHERE a = ?1 AND b = ?2 ORDER BY a, b, c LIMIT 1024";
+        let t = Instant::now();
+        let mut k = 0usize;
+        for _ in 0..reps {
+            for (s, p) in &ids {
+                let args: Vec<i64> = vec![*s as i64, *p as i64];
+                let mut st = conn.prepare_cached(sql).unwrap();
+                let rows: Vec<(i64, i64, i64)> = st
+                    .query_map(rusqlite::params_from_iter(args), |r| {
+                        Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+                    })
+                    .unwrap()
+                    .collect::<Result<_, _>>()
+                    .unwrap();
+                k += rows.len();
+            }
+        }
+        println!(
+            "as page(): prepare_cached + params_from_iter + collect: {:.1} us ({k})",
+            t.elapsed().as_secs_f64() * 1e6 / (reps * ids.len()) as f64
+        );
+        conn.execute_batch("BEGIN").unwrap();
+        let t = Instant::now();
+        for _ in 0..reps {
+            for (s, p) in &ids {
+                let mut st = conn.prepare_cached(sql).unwrap();
+                let rows: Vec<(i64, i64, i64)> = st
+                    .query_map([*s as i64, *p as i64], |r| {
+                        Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+                    })
+                    .unwrap()
+                    .collect::<Result<_, _>>()
+                    .unwrap();
+                k += rows.len();
+            }
+        }
+        println!(
+            "same inside a read transaction: {:.1} us",
+            t.elapsed().as_secs_f64() * 1e6 / (reps * ids.len()) as f64
+        );
+        conn.execute_batch("COMMIT").unwrap();
+        conn.set_db_config(
+            rusqlite::config::DbConfig::SQLITE_DBCONFIG_ENABLE_QPSG,
+            true,
+        )
+        .unwrap();
+        conn.flush_prepared_statement_cache();
+        let t = Instant::now();
+        for _ in 0..reps {
+            for (s, p) in &ids {
+                let mut st = conn.prepare_cached(sql).unwrap();
+                let rows: Vec<(i64, i64, i64)> = st
+                    .query_map([*s as i64, *p as i64], |r| {
+                        Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+                    })
+                    .unwrap()
+                    .collect::<Result<_, _>>()
+                    .unwrap();
+                k += rows.len();
+            }
+        }
+        println!(
+            "as page() with QPSG on: {:.1} us",
+            t.elapsed().as_secs_f64() * 1e6 / (reps * ids.len()) as f64
+        );
+        let t = Instant::now();
+        for _ in 0..reps {
+            for (s, p) in &ids {
+                let mut st = conn.prepare_cached(sql).unwrap();
+                let mut rows = st.query([*s as i64, *p as i64]).unwrap();
+                while let Some(_r) = rows.next().unwrap() {
+                    k += 1;
+                }
+            }
+        }
+        println!(
+            "prepare_cached + query (no query_map): {:.1} us",
+            t.elapsed().as_secs_f64() * 1e6 / (reps * ids.len()) as f64
+        );
+        let mut st = conn.prepare(sql).unwrap();
+        let t = Instant::now();
+        for _ in 0..reps {
+            for (s, p) in &ids {
+                let rows: Vec<(i64, i64, i64)> = st
+                    .query_map([*s as i64, *p as i64], |r| {
+                        Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+                    })
+                    .unwrap()
+                    .collect::<Result<_, _>>()
+                    .unwrap();
+                k += rows.len();
+            }
+        }
+        let (s0, p0) = ids[0];
+        let t = Instant::now();
+        for _ in 0..(reps * ids.len()) {
+            let mut st = conn.prepare_cached(sql).unwrap();
+            let mut rows = st.query([s0 as i64, p0 as i64]).unwrap();
+            while let Some(_r) = rows.next().unwrap() {}
+        }
+        println!(
+            "prepare_cached + query, same params every time: {:.1} us",
+            t.elapsed().as_secs_f64() * 1e6 / (reps * ids.len()) as f64
+        );
+        let opts: Vec<String> = conn
+            .prepare("PRAGMA compile_options")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .map(|x| x.unwrap())
+            .filter(|o: &String| o.contains("STAT"))
+            .collect();
+        println!("SQLite compile options with STAT: {opts:?}");
+        let t = Instant::now();
+        for _ in 0..(reps * ids.len()) {
+            let _st = conn.prepare(sql).unwrap();
+        }
+        println!(
+            "prepare() alone: {:.1} us",
+            t.elapsed().as_secs_f64() * 1e6 / (reps * ids.len()) as f64
+        );
+        let t = Instant::now();
+        for _ in 0..(reps * ids.len()) {
+            let _st = conn.prepare_cached(sql).unwrap();
+        }
+        println!(
+            "prepare_cached() alone: {:.1} us",
+            t.elapsed().as_secs_f64() * 1e6 / (reps * ids.len()) as f64
+        );
+        println!(
+            "prepared once + query_map + collect: {:.1} us",
+            t.elapsed().as_secs_f64() * 1e6 / (reps * ids.len()) as f64
+        );
+    }
+    println!(
+        "term decode: dqaDB {:.1} us",
+        t.elapsed().as_secs_f64() * 1e6 / (reps * ids.len()) as f64
+    );
+}
+
 /// Fixed per-query costs of `Kb::query` on a KB, each step timed alone.
 fn overhead(dir: &Path) {
     use dqadb_core::sparql::Limits;
@@ -477,6 +855,8 @@ fn main() {
         ),
         Some("compare") => compare(&p(2), &p(3)),
         Some("overhead") => overhead(&p(2)),
+        Some("lookup") => lookup(&p(2), &p(3)),
+        Some("profile") => profile(&p(2), &p(3), a[4].parse().unwrap()),
         _ => {
             eprintln!("see the module docs for modes");
             std::process::exit(2);

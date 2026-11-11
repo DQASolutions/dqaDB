@@ -593,7 +593,10 @@ dependencies = [
  "oxigraph",
  "oxrdf",
  "oxrdfio",
+ "rusqlite",
  "serde_json",
+ "spareval",
+ "spargebra",
  "zstd",
 ]
 

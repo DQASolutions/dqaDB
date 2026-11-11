@@ -58,16 +58,16 @@ Results are compared by value (dqaDB stores canonical literals, e.g. `1200.5` fo
 |---|---|---|
 | Load | 3.0 s (bulk loader) | 14.8 s (`import`: validation, event files, source copy, index) |
 | Disk | 45 MB | 156 MB index (+ 105 MB events, 92 MB source copy) |
-| Query mix | **802 queries/s** (17.1 s) | **343 queries/s** (40.1 s) |
+| Query mix | 810 queries/s (17.0 s) | **1,408 queries/s** (9.8 s) |
 | Results | | **13,750 / 13,750 identical** |
-| Peak RSS | 83 MB | 136 MB |
+| Peak RSS | 83 MB | 135 MB |
 
 Mean latency per BSBM query template (ms):
 
 | | T1 | T2 | T3 | T4 | T5 | T6 | T7 | T8 | T9 | T10 | T11 |
 |---|---|---|---|---|---|---|---|---|---|---|---|
 | Oxigraph | 0.28 | 1.07 | 0.48 | 0.51 | 7.05 | 1.30 | 0.92 | 0.09 | 0.80 | 0.14 | 0.28 |
-| dqaDB | 0.45 | 1.73 | 0.99 | 0.72 | 20.99 | 2.53 | 1.84 | 0.26 | 1.35 | 0.31 | 0.51 |
+| dqaDB | 0.30 | 0.71 | 0.43 | 0.43 | 2.83 | 0.78 | 0.67 | 0.17 | 0.52 | 0.23 | 0.36 |
 
 T1 product type + features + numeric filter · T2 product details · T3 type + feature
 negation · T4 UNION · T5 similar products (numeric range joins) · T6 product + offers +
@@ -76,16 +76,31 @@ of an entity · T11 CONSTRUCT offer. Empty-result shares are the same on both sy
 (about 11% of the mix's parameters refer to offers/reviews that only the update stream
 creates).
 
-Reading:
-- dqaDB returns the same answers; it is 2.3x slower on the mix, and T5 (similar
-  products: a join with numeric range filters, 3x slower) is more than half of its time.
-  The other templates are 1.3–3x slower; the gap there is the dataset layer.
-- Fixed cost per `Kb::query`, measured with `overhead`, went from 3.6 ms to 0.11 ms
-  (168 -> 343 queries/s): the schema files were parsed twice per query (now kept until a
-  schema file changes, like SQLite's schema cookie), the RDFS rules were recomputed per
-  query (now once per parsed schema), and the freshness check listed the newest day's
-  event files (now reads `events/HEAD`, a pointer the writer updates, like Lucene's
-  `segments_N`).
+Reading: at this scale (the whole index fits in memory on both) dqaDB answers the mix
+1.7x faster with the same results; Oxigraph is faster on the smallest queries (T8, T10:
+dqaDB's fixed cost per query is ~0.1 ms) and loads 5x faster into a 3.5x smaller index.
+Larger scales are not measured yet.
+
+How dqaDB got there (each step measured with the diagnostics below, not guessed):
+
+| Step | Queries/s |
+|---|---|
+| first run | 168 (first 1000 queries) |
+| ontology parsed once per schema change, not twice per query (like SQLite's schema cookie) | 289 |
+| `events/HEAD` pointer instead of listing event files; RDFS rules computed once | 343 |
+| per-query cache of decoded terms (like Jena TDB's node cache) | 389 |
+| SQLite query planner stability guarantee (QPSG) | **1,408** |
+
+The last one was the big one: the bundled SQLite is built with STAT4, which marks
+statements whose plan could depend on a bound value for re-prepare, and rusqlite clears a
+statement's bindings when it returns to the cache, which expires it. Every reuse of a
+cached statement was therefore recompiled: 14.5 us per pattern lookup instead of 2.1 us,
+and T5 does about 950 lookups. dqaDB never runs ANALYZE, so plans do not depend on bound
+values; `SQLITE_DBCONFIG_ENABLE_QPSG` keeps the prepared plan.
+
+Diagnostics: `overhead <kb>` (fixed per-query steps), `profile <kb> <mix> <template>`
+(engine calls into the dataset and their time), `lookup <kb> <oxigraph dir>` (one
+pattern lookup on both, and the raw SQLite floor).
 
 `overhead <kb dir>` times the fixed per-query steps; `compare a.jsonl b.jsonl` checks
 results query by query.

@@ -850,7 +850,8 @@ impl Kb {
         let reader = store.read()?;
         let event_ns = self.event_namespace();
         let events_dir = self.events_dir();
-        let dataset = sparql::KbDataset::new(&reader, &event_ns, &events_dir);
+        let cache = sparql::TermCache::default();
+        let dataset = sparql::KbDataset::new(&reader, &event_ns, &events_dir, &cache);
         sparql::run(dataset, &onto.prefixes, query, limits)
     }
 
