@@ -1333,3 +1333,142 @@ fn readers_find_new_events_through_head() {
         event::latest(&events).unwrap()
     );
 }
+
+#[test]
+fn sparql_protocol_requests_and_content_negotiation() {
+    use dqadb_core::sparql_http::{Request, handle};
+    let (_dir, kb) = new_kb();
+    kb.assert(&acme(), &opts()).unwrap();
+    let limits = Limits::default();
+    let enc = |q: &str| form_urlencoded::byte_serialize(q.as_bytes()).collect::<String>();
+    let q = "SELECT ?l WHERE { ?c a ex:Company ; rdfs:label ?l }";
+    let get = |url_query: &str, accept: Option<&str>| {
+        handle(
+            &kb,
+            &Request {
+                method: "GET",
+                url_query: Some(url_query),
+                content_type: None,
+                accept,
+                body: b"",
+            },
+            &limits,
+        )
+    };
+    let body = |r: &dqadb_core::sparql_http::Response| String::from_utf8(r.body.clone()).unwrap();
+
+    // GET, default format: SPARQL results JSON
+    let r = get(&format!("query={}", enc(q)), None);
+    assert_eq!(
+        (r.status, r.content_type.as_str()),
+        (200, "application/sparql-results+json")
+    );
+    let j: serde_json::Value = serde_json::from_slice(&r.body).unwrap();
+    assert_eq!(j["head"]["vars"], serde_json::json!(["l"]));
+    assert_eq!(j["results"]["bindings"][0]["l"]["value"], "ACME Logistics");
+    assert_eq!(j["results"]["bindings"][0]["l"]["xml:lang"], "vi");
+    // Accept with q-values: CSV preferred over XML
+    let r = get(
+        &format!("query={}", enc(q)),
+        Some("application/sparql-results+xml;q=0.5, text/csv"),
+    );
+    assert_eq!(
+        (r.status, r.content_type.as_str()),
+        (200, "text/csv; charset=utf-8")
+    );
+    assert_eq!(body(&r), "l\r\nACME Logistics\r\n");
+    let r = get(
+        &format!("query={}", enc(q)),
+        Some("application/sparql-results+xml"),
+    );
+    assert!(body(&r).contains("<sparql"), "{}", body(&r));
+    // ASK
+    let r = get(
+        &format!("query={}", enc("ASK { ?c a ex:Contract }")),
+        Some("application/json"),
+    );
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&r.body).unwrap()["boolean"],
+        true
+    );
+    // CONSTRUCT: N-Triples by default, Turtle on request, 406 for a results-only type
+    let c = "CONSTRUCT { ?c ex:country ?x } WHERE { ?c ex:country ?x }";
+    let r = get(&format!("query={}", enc(c)), None);
+    assert_eq!(r.content_type, "application/n-triples");
+    assert!(
+        body(&r).contains("<https://example.org/ont#country> \"VN\" ."),
+        "{}",
+        body(&r)
+    );
+    let r = get(&format!("query={}", enc(c)), Some("text/turtle"));
+    assert_eq!(r.content_type, "text/turtle; charset=utf-8");
+    let r = get(
+        &format!("query={}", enc(c)),
+        Some("application/sparql-results+json"),
+    );
+    assert_eq!(r.status, 406);
+
+    // POST form and POST application/sparql-query
+    let post = |ct: &str, b: &[u8]| {
+        handle(
+            &kb,
+            &Request {
+                method: "POST",
+                url_query: None,
+                content_type: Some(ct),
+                accept: Some("text/tab-separated-values"),
+                body: b,
+            },
+            &limits,
+        )
+    };
+    let r = post(
+        "application/x-www-form-urlencoded",
+        format!("query={}", enc(q)).as_bytes(),
+    );
+    assert_eq!(
+        (r.status, body(&r).as_str()),
+        (200, "?l\n\"ACME Logistics\"@vi\n")
+    );
+    let r = post("application/sparql-query; charset=utf-8", q.as_bytes());
+    assert_eq!(r.status, 200);
+
+    // refused or malformed requests
+    assert_eq!(
+        post("application/sparql-update", b"INSERT DATA {}").status,
+        400
+    );
+    assert_eq!(
+        post(
+            "application/x-www-form-urlencoded",
+            b"update=INSERT+DATA+%7B%7D"
+        )
+        .status,
+        400
+    );
+    assert_eq!(post("text/plain", q.as_bytes()).status, 415);
+    assert_eq!(get("", None).status, 400);
+    assert_eq!(
+        get(&format!("query={}&query={}", enc(q), enc(q)), None).status,
+        400
+    );
+    assert_eq!(
+        get(&format!("query={}&default-graph-uri=urn%3Ax", enc(q)), None).status,
+        400
+    );
+    let r = get(&format!("query={}", enc("SELECT WHERE")), None);
+    assert_eq!(r.status, 400);
+    assert!(body(&r).contains("SPARQL syntax error"), "{}", body(&r));
+    let r = handle(
+        &kb,
+        &Request {
+            method: "PUT",
+            url_query: None,
+            content_type: None,
+            accept: None,
+            body: b"",
+        },
+        &limits,
+    );
+    assert_eq!(r.status, 405);
+}

@@ -94,3 +94,15 @@ dqadb query 'SELECT ?g WHERE { GRAPH ?g { ?s ex:country "VN" } }'   # which even
 ```
 
 The default graph is the current state (asserted + inferred facts). Named graph `dqadb:event:<ULID>` (`urn:dqadb:event:<ULID>`) holds what that event asserted and is still in effect. KB prefixes are predeclared; `--limit` and `--timeout` bound the work.
+
+Over HTTP, `dqadb serve` answers the [SPARQL 1.1 Protocol](https://www.w3.org/TR/sparql11-protocol/) query operation at `/sparql` (127.0.0.1 only), so SPARQL clients and tools can query the KB:
+
+```bash
+curl -H 'Accept: text/csv' --data-urlencode 'query=SELECT ?c WHERE { ?c a ex:Company }' http://127.0.0.1:7700/sparql
+curl -H 'Content-Type: application/sparql-query' -H 'Accept: text/turtle' \
+     --data 'CONSTRUCT { ?c ?p ?o } WHERE { ?c a ex:Company ; ?p ?o }' http://127.0.0.1:7700/sparql
+```
+
+`GET ?query=`, `POST` form and `POST application/sparql-query` are accepted. Results come as SPARQL JSON (default), XML, CSV or TSV, graphs as N-Triples (default), Turtle, RDF/XML or JSON-LD, chosen from `Accept`. It is read-only: SPARQL Update is refused (changes go through events: `assert`, `import`), as are `default-graph-uri` / `named-graph-uri` (the dataset is fixed). Queries are cancelled after `--query-timeout` (30 s). Without an installed embedding model, `serve` still serves SPARQL, with background embedding off.
+
+Performance against Oxigraph 0.5.13 (same SPARQL engine) on the Berlin SPARQL Benchmark: identical results on all 13,750 queries of the explore mix; 1,408 vs 810 queries/s at 1000 products, 502 vs 205 at 10,000 (3.6M triples); loading is 5-11x slower (validation, event files). See `bench/sparql`.

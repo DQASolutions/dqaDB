@@ -60,14 +60,19 @@ enum Cmd {
         Runtime: embedding.onnxruntime / DQADB_ORT_LIB (official libonnxruntime.so)"
     )]
     /// Resident process: keeps the embedding model loaded, embeds changes in the
-    /// background and answers query embedding for other `dqadb` commands
-    #[command(after_help = "Example:\n  dqadb serve --port 7700 --interval 10")]
+    /// background, answers query embedding for other `dqadb` commands, and serves a
+    /// read-only SPARQL 1.1 Protocol endpoint at /sparql
+    #[command(after_help = "Examples:\n  dqadb serve --port 7700 --interval 10\n  \
+        curl -H 'Accept: text/csv' --data-urlencode 'query=SELECT * WHERE { ?s ?p ?o } LIMIT 5' http://127.0.0.1:7700/sparql")]
     Serve {
         #[arg(long, default_value_t = 7700)]
         port: u16,
         /// Seconds between background embedding runs
         #[arg(long, default_value_t = 10)]
         interval: u64,
+        /// Seconds before a SPARQL query over HTTP is cancelled
+        #[arg(long, default_value_t = 30)]
+        query_timeout: u64,
     },
     Embed {
         /// Rebuild the HNSW base now (normally done when the delta grows past 10%)
@@ -613,8 +618,17 @@ fn run(cli: Cli) -> Result<()> {
                 }
             );
         }
-        Cmd::Serve { port, interval } => {
-            return server::run(kb, port, std::time::Duration::from_secs(interval));
+        Cmd::Serve {
+            port,
+            interval,
+            query_timeout,
+        } => {
+            return server::run(
+                kb,
+                port,
+                std::time::Duration::from_secs(interval),
+                std::time::Duration::from_secs(query_timeout),
+            );
         }
         Cmd::Embed { compact } => {
             let r = kb.embed(compact)?;

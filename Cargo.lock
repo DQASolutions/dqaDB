@@ -703,6 +703,7 @@ name = "dqadb-core"
 version = "0.1.0"
 dependencies = [
  "chrono",
+ "form_urlencoded",
  "half",
  "hex",
  "memmap2",
@@ -715,6 +716,7 @@ dependencies = [
  "serde_json",
  "serde_yaml",
  "sha2",
+ "sparesults",
  "spareval",
  "spargebra",
  "tantivy",

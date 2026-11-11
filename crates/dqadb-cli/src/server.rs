@@ -2,12 +2,16 @@
 //! - keeps the embedding model loaded and answers `/embed` for CLI query embedding;
 //! - runs the background vectorizer: `embed` on an interval (catch-up by watermark,
 //!   HNSW base rebuild when the delta grows); writes never wait for it;
+//! - serves a read-only SPARQL 1.1 Protocol endpoint at `/sparql` (GET, POST form,
+//!   POST application/sparql-query; results by Accept), see `dqadb_core::sparql_http`;
 //! - advertises itself in `.dqadb/serve.json` (removed on shutdown).
 //!
 //! Listens on 127.0.0.1 only.
 
-use axum::extract::State;
-use axum::http::StatusCode;
+use axum::body::Bytes;
+use axum::extract::{RawQuery, State};
+use axum::http::{HeaderMap, Method, StatusCode, header};
+use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use dqadb_core::serve::{ServeInfo, remove_info, write_info};
@@ -63,22 +67,80 @@ async fn embed(State(kb): State<Arc<Kb>>, Json(req): Json<EmbedRequest>) -> Repl
     ))
 }
 
-pub fn run(kb: Kb, port: u16, interval: Duration) -> Result<()> {
+struct App {
+    kb: Arc<Kb>,
+    query_timeout: Duration,
+}
+
+/// SPARQL 1.1 Protocol, query operation (read-only).
+async fn sparql(
+    State(app): State<Arc<App>>,
+    method: Method,
+    RawQuery(url_query): RawQuery,
+    headers: HeaderMap,
+    body: Bytes,
+) -> axum::response::Response {
+    let header = |h: header::HeaderName| {
+        headers
+            .get(h)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string)
+    };
+    let (content_type, accept) = (header(header::CONTENT_TYPE), header(header::ACCEPT));
+    let limits = dqadb_core::sparql::Limits {
+        rows: usize::MAX,
+        timeout: app.query_timeout,
+    };
+    let kb = app.kb.clone();
+    let r = tokio::task::spawn_blocking(move || {
+        let req = dqadb_core::sparql_http::Request {
+            method: method.as_str(),
+            url_query: url_query.as_deref(),
+            content_type: content_type.as_deref(),
+            accept: accept.as_deref(),
+            body: &body,
+        };
+        dqadb_core::sparql_http::handle(&kb, &req, &limits)
+    })
+    .await;
+    match r {
+        Ok(r) => (
+            StatusCode::from_u16(r.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+            [(header::CONTENT_TYPE, r.content_type)],
+            r.body,
+        )
+            .into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
+}
+
+pub fn run(kb: Kb, port: u16, interval: Duration, query_timeout: Duration) -> Result<()> {
     let kb = Arc::new(kb);
     let (model, _) = kb.embedder_status();
     eprintln!("dqadb serve: loading embedding model {model} ...");
     let t = std::time::Instant::now();
-    kb.embed_texts_local(&["warm-up".to_string()])?;
-    eprintln!(
-        "dqadb serve: model ready in {:.1}s",
-        t.elapsed().as_secs_f64()
-    );
+    // without a usable model, SPARQL and the other reads are still served
+    let embedding = match kb.embed_texts_local(&["warm-up".to_string()]) {
+        Ok(_) => {
+            eprintln!(
+                "dqadb serve: model ready in {:.1}s",
+                t.elapsed().as_secs_f64()
+            );
+            true
+        }
+        Err(e) => {
+            eprintln!(
+                "dqadb serve: embedding disabled ({e}); install it with: dqadb model install"
+            );
+            false
+        }
+    };
 
     let stop = Arc::new(AtomicBool::new(false));
     let worker = {
         let (kb, stop) = (kb.clone(), stop.clone());
         std::thread::spawn(move || {
-            while !stop.load(Ordering::Relaxed) {
+            while embedding && !stop.load(Ordering::Relaxed) {
                 match kb.embed(false) {
                     Ok(r) => {
                         if r.vectors_written + r.vectors_removed > 0 {
@@ -125,10 +187,20 @@ pub fn run(kb: Kb, port: u16, interval: Duration) -> Result<()> {
             },
         )?;
         eprintln!("dqadb serve: listening on http://127.0.0.1:{port} (Ctrl-C to stop)");
+        eprintln!("dqadb serve: SPARQL endpoint http://127.0.0.1:{port}/sparql");
+        let sparql_app = Arc::new(App {
+            kb: kb.clone(),
+            query_timeout,
+        });
         let app = Router::new()
             .route("/health", get(health))
             .route("/embed", post(embed))
-            .with_state(kb.clone());
+            .with_state(kb.clone())
+            .merge(
+                Router::new()
+                    .route("/sparql", get(sparql).post(sparql))
+                    .with_state(sparql_app),
+            );
         axum::serve(listener, app)
             .with_graceful_shutdown(async {
                 let _ = tokio::signal::ctrl_c().await;

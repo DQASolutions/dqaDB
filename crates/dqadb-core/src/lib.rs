@@ -15,6 +15,7 @@ pub mod rdf;
 pub mod search;
 pub mod serve;
 pub mod sparql;
+pub mod sparql_http;
 pub mod store;
 pub mod vectors;
 
