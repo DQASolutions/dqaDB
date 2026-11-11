@@ -31,6 +31,17 @@ struct LmSchema {
     slots: BTreeMap<String, Option<LmSlot>>,
     #[serde(default)]
     enums: BTreeMap<String, Option<LmEnum>>,
+    #[serde(default)]
+    types: BTreeMap<String, Option<LmType>>,
+}
+
+/// A LinkML type: a datatype IRI (`uri`) whose values are checked as its base type
+/// (`typeof`, a built-in such as decimal), e.g. a currency amount `bsbm:USD`.
+#[derive(Debug, Default, Deserialize)]
+struct LmType {
+    uri: Option<String>,
+    #[serde(rename = "typeof")]
+    typeof_name: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -110,6 +121,8 @@ pub struct Ontology {
     /// keyed by predicate IRI
     pub slots: BTreeMap<String, SlotDef>,
     pub enums: BTreeMap<String, BTreeSet<String>>,
+    /// datatype IRI of a schema `types:` entry -> the XSD datatype its values are checked as
+    pub type_bases: BTreeMap<String, String>,
     /// `sha256:<hex>` over all schema files; recorded in every event.
     pub hash: String,
 }
@@ -279,9 +292,31 @@ impl Ontology {
             }
         }
 
+        // schema types: name -> (datatype IRI, XSD base)
+        let mut types: HashMap<String, (String, String)> = HashMap::new();
+        for (_, s) in &schemas {
+            for (name, t) in &s.types {
+                let t = t.as_ref();
+                let base_name = t
+                    .and_then(|t| t.typeof_name.clone())
+                    .unwrap_or_else(|| "string".into());
+                let Some(Range::Datatype(base)) = builtin_range(&base_name) else {
+                    return Err(Error::other(format!(
+                        "type {name}: typeof '{base_name}' is not a built-in literal type"
+                    )));
+                };
+                let uri = iri_of(&t.and_then(|t| t.uri.clone()), name)?;
+                types.insert(name.clone(), (uri, base));
+            }
+        }
+        let type_bases: BTreeMap<String, String> = types.values().cloned().collect();
+
         let resolve_range = |range: &str| -> Result<Range> {
             if let Some(r) = builtin_range(range) {
                 return Ok(r);
+            }
+            if let Some((uri, _)) = types.get(range) {
+                return Ok(Range::Datatype(uri.clone()));
             }
             if let Some(iri) = class_iris.get(range) {
                 return Ok(Range::Class(iri.clone()));
@@ -390,6 +425,7 @@ impl Ontology {
             classes,
             slots,
             enums,
+            type_bases,
             hash,
         })
     }
@@ -713,8 +749,9 @@ impl Ontology {
                 }
             }
         }
+        let check_dt = self.type_bases.get(dt).map(String::as_str).unwrap_or(dt);
         if let Some(lang) = lang {
-            if dt != rdf::XSD_STRING {
+            if check_dt != rdf::XSD_STRING {
                 report.push(
                     at,
                     format!("@language is only allowed on string slots; {pname} is {short_dt}"),
@@ -732,7 +769,7 @@ impl Ontology {
             }
             return Some(Term::lang(raw, lang.to_ascii_lowercase()));
         }
-        match normalize_lexical(dt, &raw) {
+        match normalize_lexical(check_dt, &raw) {
             Ok(v) => Some(Term::typed(v, dt)),
             Err(e) => {
                 report.push(
@@ -894,9 +931,15 @@ pub fn normalize_lexical(dt: &str, raw: &str) -> std::result::Result<String, Str
         "date" => chrono::NaiveDate::parse_from_str(v, "%Y-%m-%d")
             .map(|d| d.to_string())
             .map_err(|_| format!("'{raw}' is not a date (YYYY-MM-DD)")),
+        // with a timezone: RFC 3339, canonical offset form; without one (allowed by XSD,
+        // a local time): kept as given once it parses
         "dateTime" => chrono::DateTime::parse_from_rfc3339(v)
             .map(|d| d.to_rfc3339())
-            .map_err(|_| format!("'{raw}' is not an RFC 3339 date-time")),
+            .or_else(|_| {
+                chrono::NaiveDateTime::parse_from_str(v, "%Y-%m-%dT%H:%M:%S%.f")
+                    .map(|_| v.to_string())
+            })
+            .map_err(|_| format!("'{raw}' is not an xsd:dateTime (e.g. 2026-11-09T10:00:00Z)")),
         _ => Ok(raw.to_string()),
     }
 }

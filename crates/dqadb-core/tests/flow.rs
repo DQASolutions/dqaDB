@@ -1200,3 +1200,63 @@ _:c a ex:Contract ;
         .unwrap_err();
     assert!(e.to_string().contains("named graph"), "{e}");
 }
+
+#[test]
+fn linkml_types_and_local_datetimes() {
+    use dqadb_core::import::ImportOpts;
+    let (dir, kb) = new_kb();
+    // a schema type (decimal-valued currency) and an xsd:dateTime without timezone
+    std::fs::write(
+        dir.path().join("ontology/offer.linkml.yaml"),
+        "id: https://example.org/ont/offer\nname: offer\nprefixes:\n  ex: https://example.org/ont#\n\
+         default_prefix: ex\ntypes:\n  USD:\n    uri: ex:USD\n    typeof: decimal\n\
+         classes:\n  Offer:\n    slots: [price, valid_from]\n\
+         slots:\n  price:\n    range: USD\n  valid_from:\n    range: datetime\n",
+    )
+    .unwrap();
+    kb.build_ontology(true).unwrap();
+    let nt = dir.path().join("offer.nt");
+    let line =
+        |p: &str, v: &str| format!("<http://o.example/1> <https://example.org/ont#{p}> {v} .\n");
+    std::fs::write(
+        &nt,
+        format!(
+            "<http://o.example/1> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <https://example.org/ont#Offer> .\n{}{}",
+            line("price", "\"12.50\"^^<https://example.org/ont#USD>"),
+            line("valid_from", "\"2008-06-20T00:00:00\"^^<http://www.w3.org/2001/XMLSchema#dateTime>")
+        ),
+    )
+    .unwrap();
+    let r = kb
+        .import(&nt, &ImportOpts::default(), &opts(), &mut |_, _| {})
+        .unwrap();
+    assert!(r.issues.is_empty(), "{:?}", r.issues);
+    let rows = select(
+        &kb,
+        "SELECT ?p (DATATYPE(?p) AS ?t) ?v WHERE { ?o ex:price ?p ; ex:valid_from ?v }",
+    );
+    // checked as a decimal (canonical form), kept with its own datatype
+    assert_eq!(
+        rows,
+        vec![vec![
+            "\"12.5\"^^ex:USD".to_string(),
+            "ex:USD".into(),
+            "\"2008-06-20T00:00:00\"^^xsd:dateTime".into()
+        ]]
+    );
+    // not a decimal: rejected by the type's base
+    std::fs::write(
+        &nt,
+        line("price", "\"cheap\"^^<https://example.org/ont#USD>"),
+    )
+    .unwrap();
+    let r = kb
+        .import(&nt, &ImportOpts::default(), &opts(), &mut |_, _| {})
+        .unwrap();
+    assert_eq!(r.issues.len(), 1, "{:?}", r.issues);
+    assert!(
+        r.issues[0].message.contains("expects ex:USD"),
+        "{:?}",
+        r.issues
+    );
+}

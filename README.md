@@ -50,7 +50,7 @@ Exit codes: 0 ok · 1 error · 2 validation · 3 not found · 4 ontology not bui
 ## Status (milestone M1)
 
 Done: `init`, `status`, `rebuild`, `verify`, `new-id`, `ontology build|show`, `assert`, `validate`, `import`, `retract --event`, `get`, `query` (SPARQL 1.1), `search` (`--text` full-text, `--type`, `--where` filters), `traverse`, `path`, `events show|ls`; RDFS subclass inference.
-Validation enforces the LinkML schema directly (known predicates/classes, ranges, enums, required, single-valued).
+Validation enforces the LinkML schema directly (known predicates/classes, ranges, enums, required, single-valued). Schema `types:` (a datatype IRI checked as a built-in base via `typeof`, e.g. a currency `bsbm:USD` as decimal) are supported; `xsd:dateTime` values may omit the timezone, as XSD allows.
 
 Not yet: web UI (M3). SHACL: validation runs from LinkML directly; `shapes.ttl` is an export (no runtime SHACL engine until hand-written shapes need one).
 

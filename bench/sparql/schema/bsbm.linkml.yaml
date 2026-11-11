@@ -1,0 +1,135 @@
+# Berlin SPARQL Benchmark (BSBM) vocabulary as a dqaDB ontology, written from the BSBM
+# specification and checked against the generated data (explore use case, 1000
+# products). The product-type hierarchy is data-dependent and generated into
+# bsbm_product_types.linkml.yaml (bench/sparql: `bsbm-schema`).
+id: http://www4.wiwiss.fu-berlin.de/bizer/bsbm/v01/vocabulary/
+name: bsbm
+prefixes:
+  bsbm: http://www4.wiwiss.fu-berlin.de/bizer/bsbm/v01/vocabulary/
+  bsbm-inst: http://www4.wiwiss.fu-berlin.de/bizer/bsbm/v01/instances/
+  dc: http://purl.org/dc/elements/1.1/
+  foaf: http://xmlns.com/foaf/0.1/
+  rev: http://purl.org/stuff/rev#
+  linkml: https://w3id.org/linkml/
+default_prefix: bsbm
+default_range: string
+imports:
+  - linkml:types
+
+types:
+  USD:
+    uri: bsbm:USD
+    typeof: decimal
+
+classes:
+  ProductType:
+    class_uri: bsbm:ProductType
+    slots: [label, comment, sub_class_of, publisher, date]
+  ProductFeature:
+    class_uri: bsbm:ProductFeature
+    slots: [label, comment, publisher, date]
+  Producer:
+    class_uri: bsbm:Producer
+    slots: [label, comment, homepage, country, publisher, date]
+  Vendor:
+    class_uri: bsbm:Vendor
+    slots: [label, comment, homepage, country, publisher, date]
+  Product:
+    class_uri: bsbm:Product
+    slots: [label, comment, producer, productFeature,
+            productPropertyNumeric1, productPropertyNumeric2, productPropertyNumeric3,
+            productPropertyNumeric4, productPropertyNumeric5, productPropertyNumeric6,
+            productPropertyTextual1, productPropertyTextual2, productPropertyTextual3,
+            productPropertyTextual4, productPropertyTextual5, productPropertyTextual6,
+            publisher, date]
+  Offer:
+    class_uri: bsbm:Offer
+    slots: [product, vendor, price, validFrom, validTo, deliveryDays, offerWebpage, publisher, date]
+  Person:
+    class_uri: foaf:Person
+    slots: [name, mbox_sha1sum, country, publisher, date]
+  Review:
+    class_uri: rev:Review
+    slots: [reviewFor, reviewer, reviewDate, title, text, rating1, rating2, rating3, rating4, publisher, date]
+
+slots:
+  label:
+    slot_uri: rdfs:label
+    required: true
+    annotations:
+      dqadb_index: fts,card
+  comment:
+    slot_uri: rdfs:comment
+    annotations:
+      dqadb_index: fts
+  sub_class_of:
+    slot_uri: rdfs:subClassOf
+    range: ProductType
+  publisher:
+    slot_uri: dc:publisher
+    range: uri
+    required: true
+  date:
+    slot_uri: dc:date
+    range: date
+    required: true
+  homepage:
+    slot_uri: foaf:homepage
+    range: uri
+  country:
+    range: uri
+    required: true
+  producer:
+    range: Producer
+    required: true
+  productFeature:
+    range: ProductFeature
+    multivalued: true
+  productPropertyNumeric1: {range: integer}
+  productPropertyNumeric2: {range: integer}
+  productPropertyNumeric3: {range: integer}
+  productPropertyNumeric4: {range: integer}
+  productPropertyNumeric5: {range: integer}
+  productPropertyNumeric6: {range: integer}
+  productPropertyTextual1: {range: string}
+  productPropertyTextual2: {range: string}
+  productPropertyTextual3: {range: string}
+  productPropertyTextual4: {range: string}
+  productPropertyTextual5: {range: string}
+  productPropertyTextual6: {range: string}
+  product:
+    range: Product
+    required: true
+  vendor:
+    range: Vendor
+    required: true
+  price:
+    range: USD
+    required: true
+  validFrom: {range: datetime}
+  validTo: {range: datetime}
+  deliveryDays: {range: integer}
+  offerWebpage: {range: uri}
+  name:
+    slot_uri: foaf:name
+    required: true
+  mbox_sha1sum:
+    slot_uri: foaf:mbox_sha1sum
+  reviewFor:
+    range: Product
+    required: true
+  reviewer:
+    slot_uri: rev:reviewer
+    range: Person
+    required: true
+  reviewDate: {range: datetime}
+  title:
+    slot_uri: dc:title
+  text:
+    slot_uri: rev:text
+    annotations:
+      dqadb_index: fts
+  rating1: {range: integer}
+  rating2: {range: integer}
+  rating3: {range: integer}
+  rating4: {range: integer}
