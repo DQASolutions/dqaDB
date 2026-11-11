@@ -556,6 +556,74 @@ fn profile(dq: &Path, mix: &Path, template_id: usize) {
     );
 }
 
+/// SQLite insert cost of the pos/osp permutations for 3.5M BSBM-like triples in batches
+/// of 50k: in file order vs sorted per batch (same pragmas as the dqaDB index).
+fn insert_order(dir: &Path) {
+    let n = 3_500_000u64;
+    let batch = 50_000usize;
+    let mut seed = 7u64;
+    let mut rnd = move || {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        seed
+    };
+    // subjects in file order, ~12 triples each; 40 predicates; objects: half shared
+    // (types, features, producers), half unique literals
+    let triples: Vec<(i64, i64, i64)> = (0..n)
+        .map(|k| {
+            let s = (k / 12) as i64 + 1;
+            let p = (rnd() % 40) as i64 + 1_000_000_000;
+            let o = if k % 2 == 0 {
+                (rnd() % 20_000) as i64 + 2_000_000_000
+            } else {
+                3_000_000_000 + k as i64
+            };
+            (s, p, o)
+        })
+        .collect();
+    for sorted in [false, true] {
+        let path = dir.join(format!("order-{sorted}.sqlite"));
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("sqlite-wal"));
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch("PRAGMA page_size=16384; PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA cache_size=-65536;
+            CREATE TABLE pos(a INTEGER NOT NULL, b INTEGER NOT NULL, c INTEGER NOT NULL, PRIMARY KEY(a,b,c)) WITHOUT ROWID;
+            CREATE TABLE osp(a INTEGER NOT NULL, b INTEGER NOT NULL, c INTEGER NOT NULL, PRIMARY KEY(a,b,c)) WITHOUT ROWID;").unwrap();
+        let t = Instant::now();
+        for chunk in triples.chunks(batch) {
+            let mut pos: Vec<(i64, i64, i64)> = chunk.iter().map(|&(s, p, o)| (p, o, s)).collect();
+            let mut osp: Vec<(i64, i64, i64)> = chunk.iter().map(|&(s, p, o)| (o, s, p)).collect();
+            if sorted {
+                pos.sort_unstable();
+                osp.sort_unstable();
+            }
+            let tx = conn.unchecked_transaction().unwrap();
+            {
+                let mut a = tx
+                    .prepare_cached("INSERT OR IGNORE INTO pos VALUES (?1, ?2, ?3)")
+                    .unwrap();
+                for r in &pos {
+                    a.execute([r.0, r.1, r.2]).unwrap();
+                }
+                let mut b = tx
+                    .prepare_cached("INSERT OR IGNORE INTO osp VALUES (?1, ?2, ?3)")
+                    .unwrap();
+                for r in &osp {
+                    b.execute([r.0, r.1, r.2]).unwrap();
+                }
+            }
+            tx.commit().unwrap();
+        }
+        println!(
+            "sorted per batch {sorted}: {:.1} s for {n} triples x 2 tables",
+            t.elapsed().as_secs_f64()
+        );
+        drop(conn);
+        let _ = std::fs::remove_file(&path);
+    }
+}
+
 /// Cost of one bound-subject, bound-predicate lookup (the pattern most BSBM joins do),
 /// dqaDB's index scan vs Oxigraph's store, over every product's rdfs:label and
 /// productPropertyNumeric1.
@@ -856,6 +924,7 @@ fn main() {
         Some("compare") => compare(&p(2), &p(3)),
         Some("overhead") => overhead(&p(2)),
         Some("lookup") => lookup(&p(2), &p(3)),
+        Some("insert-order") => insert_order(&p(2)),
         Some("profile") => profile(&p(2), &p(3), a[4].parse().unwrap()),
         _ => {
             eprintln!("see the module docs for modes");

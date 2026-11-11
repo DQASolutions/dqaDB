@@ -79,7 +79,7 @@ creates).
 Reading: at this scale (the whole index fits in memory on both) dqaDB answers the mix
 1.7x faster with the same results; Oxigraph is faster on the smallest queries (T8, T10:
 dqaDB's fixed cost per query is ~0.1 ms) and loads 5x faster into a 3.5x smaller index.
-Larger scales are not measured yet.
+At 10,000 products the gap grows (below).
 
 How dqaDB got there (each step measured with the diagnostics below, not guessed):
 
@@ -97,6 +97,45 @@ statement's bindings when it returns to the cache, which expires it. Every reuse
 cached statement was therefore recompiled: 14.5 us per pattern lookup instead of 2.1 us,
 and T5 does about 950 lookups. dqaDB never runs ANALYZE, so plans do not depend on bound
 values; `SQLITE_DBCONFIG_ENABLE_QPSG` keeps the prepared plan.
+
+## 10,000 products (3,564,773 triples)
+
+`explore-10000.nt.zst` (877 MB of N-Triples; 329 product types). The only published mix
+is the 1000-product one; all of its 6,387 parameter IRIs exist in this dataset, so it is
+used as is (deviation from BSBM: product/offer/review parameters come from the first 1000
+products; the type and feature queries T1, T3, T4, T5 still run over all 10,000).
+
+| | Oxigraph 0.5.13 | dqaDB |
+|---|---|---|
+| Load | 17.4 s (204k triples/s) | 192 s (18.6k triples/s) |
+| Disk | 410 MB | 1,279 MB index (3,239 MB with events and source copy) |
+| Query mix | 205 queries/s (66.9 s) | **502 queries/s** (27.4 s) |
+| Results | | **13,750 / 13,750 identical** |
+| Peak RSS (queries) | 194 MB | 310 MB |
+
+| ms | T1 | T2 | T3 | T4 | T5 | T6 | T7 | T8 | T9 | T10 | T11 |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| Oxigraph | 1.34 | 1.22 | 2.20 | 1.96 | 51.05 | 0.86 | 0.61 | 0.13 | 0.48 | 0.23 | 0.36 |
+| dqaDB | 0.53 | 0.74 | 0.92 | 0.84 | 18.51 | 0.67 | 0.56 | 0.19 | 0.40 | 0.23 | 0.38 |
+
+## Where dqaDB's load time goes (1000 products, 14.5 s)
+
+Measured with temporary timers around each phase of `import`:
+
+| Phase | s |
+|---|---|
+| index writes (`apply`: dictionary + spo/pos/osp/props/prov rows) | 4.3 |
+| validation, pass 1 | 2.0 |
+| validation again in pass 2 (`normalize` while writing) | 2.0 |
+| parsing (each pass) | 1.2 + 1.2 |
+| event files (JSON + fsync) | 1.3 |
+| SQLite commits | 0.9 |
+
+About 3 s (20%) is the second parse + validation, the price of validating the whole file
+before writing anything. Sorting each batch per index table before inserting (what
+Oxigraph's bulk loader and Jena's tdbloader do at a larger scale) gained only 16% on the
+pos/osp inserts in isolation (`insert-order`: 25.7 s -> 21.7 s for 3.5M triples x 2
+tables); per-row insert cost, not order, dominates at this size.
 
 Diagnostics: `overhead <kb>` (fixed per-query steps), `profile <kb> <mix> <template>`
 (engine calls into the dataset and their time), `lookup <kb> <oxigraph dir>` (one
