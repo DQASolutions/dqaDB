@@ -820,6 +820,66 @@ fn hnsw_segments_plus_delta_match_exact_and_stay_correct() {
         before.iter().all(|l| l.contains("năng lượng mặt trời")),
         "{before:?}"
     );
+    // small flushes past the segment cap merge by appending into an existing graph;
+    // each round also updates an entity of the previous round, so the graph appended
+    // into carries deleted nodes (tombstoned in the graph, no deletion list)
+    let live_ids: Vec<usize> = (1..300).filter(|n| n % 3 != 0).collect();
+    let mut label: std::collections::HashMap<usize, String> = live_ids
+        .iter()
+        .map(|&n| (n, format!("Org {n} {}", topics[n % topics.len()])))
+        .collect();
+    let mut old_labels = Vec::new();
+    let mut appended = false;
+    for round in 0..dqadb_core::ann::max_segments() + 3 {
+        let mut pick: Vec<usize> = live_ids[10 * round..10 * round + 10].to_vec();
+        if round > 0 {
+            pick.push(live_ids[10 * (round - 1)]);
+        }
+        let mut list = Vec::new();
+        for &n in &pick {
+            let s = res.id_map[&format!("_:o{n}")].replace("urn:dqadb:", "dqadb:");
+            // the test embedder ignores numbers: spell them as letters
+            let word = |mut x: usize| {
+                let mut w = String::new();
+                loop {
+                    w.push((b'a' + (x % 26) as u8) as char);
+                    x /= 26;
+                    if x == 0 {
+                        break w;
+                    }
+                }
+            };
+            let new = format!("Org {n} {}x{} hàng không", word(n), word(round));
+            list.push(serde_json::json!({"op": "retract", "s": s, "p": "rdfs:label", "o": label[&n]}));
+            list.push(serde_json::json!({"op": "add", "s": s, "p": "rdfs:label", "o": new}));
+            old_labels.push(std::mem::replace(label.get_mut(&n).unwrap(), new));
+        }
+        kb.assert(&ops(serde_json::Value::Array(list)), &opts())
+            .unwrap();
+        kb.embed_sync().unwrap();
+        let c = dqadb_core::ann::build(
+            &dir.path().join(".dqadb/index.sqlite"),
+            &dir.path().join(".dqadb/vec"),
+            64,
+            false,
+        )
+        .unwrap();
+        assert_eq!(c.vectors, 241, "{c:?}");
+        let m = dqadb_core::ann::load_manifest(&dir.path().join(".dqadb/vec")).unwrap();
+        assert!(m.segments.len() <= dqadb_core::ann::max_segments() + 1, "{m:?}");
+        appended |= m.segments.iter().any(|s| s.deleted > 0 && s.del.is_none());
+        // an append inserts only the smaller segments' vectors, never all of them
+        assert!(c.written < 241, "{c:?}");
+    }
+    assert!(appended, "no merge appended into a graph with deleted nodes");
+    let all = sem("hàng không", 300);
+    for l in &old_labels {
+        assert!(!all.contains(l), "replaced label {l} returned");
+    }
+    for n in &live_ids[..10 * (dqadb_core::ann::max_segments() + 3)] {
+        assert_eq!(sem(&label[n], 1), vec![label[n].clone()]);
+    }
+
     // a forced full build puts everything back into one segment
     kb.assert(
         &ops(

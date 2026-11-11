@@ -9,10 +9,15 @@
 //!   (an immutable, versioned file) naming its nodes that are no longer current. A
 //!   deleted node still routes searches, so the graph keeps its connectivity.
 //! - `build` ("flush") turns the delta into a new small segment and extends the deletion
-//!   lists, then merges: segments of similar size are merged `MERGE_FACTOR` at a time
-//!   (tiered, up to `MAX_SEGMENT` vectors), and a segment whose deleted share passes
+//!   lists, then merges like Qdrant's optimizer (decision 2026-11-11): once there are
+//!   more segments below full size (`MAX_SEGMENT`) than CPU cores, the smallest (at
+//!   least `MERGE_MIN`) are merged; a segment whose deleted share passes
 //!   `VACUUM_DELETED` is rebuilt from its live vectors. Merging rebuilds only the
-//!   segments involved, never the whole index.
+//!   segments involved, never the whole index. Vector-specific systems keep few, large
+//!   segments (Qdrant: one per core; Milvus: ~1 GB; LanceDB: one index plus deltas)
+//!   because every segment costs a graph search per query; Lucene's tiered factor of
+//!   10 suits text, where a segment is a cheap lookup.
+//! - A query searches the segments in parallel (one per core) and merges the results.
 //! - `segments.json` (the manifest) names the live files and the change sequence they
 //!   cover; it is replaced atomically, so readers see either the old or the new set.
 //!   Unreferenced files are removed after a grace period (readers still holding an old
@@ -53,8 +58,24 @@ pub fn exact_max_candidates(total_vectors: u64) -> usize {
 pub const BASE_MIN_VECTORS: u64 = 20_000;
 /// Flush the delta into a new segment once this many entities changed.
 pub const FLUSH_CHANGES: u64 = 2_048;
-/// Merge this many segments of one size tier into one.
-pub const MERGE_FACTOR: usize = 8;
+/// Merge at least this many segments at once (Qdrant merges >= 3 of the smallest).
+pub const MERGE_MIN: usize = 3;
+
+/// Segments below full size to keep before merging: the number of CPU cores (Qdrant's
+/// `default_segment_number`), at least 2. Env DQADB_MAX_SEGMENTS overrides.
+pub fn max_segments() -> usize {
+    std::env::var("DQADB_MAX_SEGMENTS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or_else(cores)
+        .max(2)
+}
+
+fn cores() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(2)
+}
 /// Segments are not merged beyond this size (bounds the cost of any one rebuild).
 pub const MAX_SEGMENT: usize = 262_144;
 /// Rebuild a segment once this share of its nodes is deleted (Qdrant's default 0.2).
@@ -322,9 +343,7 @@ pub fn search(
     // is then a prefix of the top `n + k`, so pages of one query stay consistent.
     // An i8 segment only proposes candidates; their f16 vectors give the exact order.
     let pool = if m.quant == "i8" { (n * 8).max(64) } else { n }.max(ef);
-    let mut hits: Vec<(Id, f32)> = Vec::new();
-    let mut proposed: Vec<Id> = Vec::new();
-    for seg in &segments {
+    let one = |seg: &Loaded| -> Result<(Vec<Id>, Vec<f32>)> {
         if seg.index.expansion_search() != ef {
             seg.index.change_expansion_search(ef);
         }
@@ -339,16 +358,45 @@ pub fn search(
             })
         }
         .map_err(ann_err)?;
+        Ok((found.keys, found.distances))
+    };
+    // segments in parallel, one per core (a query on one small segment stays inline)
+    let width = cores().min(segments.len());
+    let per_segment: Vec<Result<(Vec<Id>, Vec<f32>)>> = if width <= 1 {
+        segments.iter().map(one).collect()
+    } else {
+        std::thread::scope(|sc| {
+            let handles: Vec<_> = (0..width)
+                .map(|t| {
+                    let (segments, one) = (&segments, &one);
+                    sc.spawn(move || {
+                        segments
+                            .iter()
+                            .skip(t)
+                            .step_by(width)
+                            .map(one)
+                            .collect::<Vec<_>>()
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .flat_map(|h| {
+                    h.join().unwrap_or_else(|_| {
+                        vec![Err(Error::other("vector segment search panicked"))]
+                    })
+                })
+                .collect()
+        })
+    };
+    let mut hits: Vec<(Id, f32)> = Vec::new();
+    let mut proposed: Vec<Id> = Vec::new();
+    for r in per_segment {
+        let (keys, distances) = r?;
         if m.quant == "i8" {
-            proposed.extend_from_slice(&found.keys);
+            proposed.extend_from_slice(&keys);
         } else {
-            hits.extend(
-                found
-                    .keys
-                    .iter()
-                    .zip(&found.distances)
-                    .map(|(k, d)| (*k, 1.0 - *d)),
-            );
+            hits.extend(keys.iter().zip(&distances).map(|(k, d)| (*k, 1.0 - *d)));
         }
     }
     if !proposed.is_empty() {
@@ -456,6 +504,56 @@ fn write_segments(dir: &Path, r: &Reader, m: &Manifest, jobs: Vec<Job>) -> Resul
     Ok(out)
 }
 
+/// Merge by appending: copy `dest`'s graph, tombstone its deleted nodes in the graph
+/// itself (usearch skips them in results but still routes through them), and insert
+/// `ids` into it from a single thread, the same sequential inserts a fresh build does.
+/// Costs the appended vectors instead of a rebuild of all of them. The new segment has
+/// no deletion list; its tombstones stay counted in `deleted` until a vacuum.
+fn append_into(dir: &Path, r: &Reader, m: &mut Manifest, dest: &Segment, ids: &[Id]) -> Result<Segment> {
+    let index = Index::new(&options(m.dim, &m.quant)).map_err(ann_err)?;
+    index
+        .load(path_str(&dir.join(format!("{}.usearch", dest.name)))?)
+        .map_err(ann_err)?;
+    index
+        .reserve_capacity_and_threads(dest.count + ids.len(), 1)
+        .map_err(ann_err)?;
+    let mut keys = live_keys(dir, dest)?;
+    if let Some(d) = &dest.del {
+        for k in read_keys(&dir.join(d))? {
+            index.remove(k).map_err(ann_err)?;
+        }
+    }
+    let mut added = 0usize;
+    r.vec_of(ids, |id, b| {
+        let v = embed::from_f16_bytes(b);
+        if v.len() != m.dim {
+            return;
+        }
+        if index.add(id, &v).is_ok() {
+            keys.push(id);
+            added += 1;
+        }
+    })?;
+    if added != ids.len() {
+        return Err(Error::other("vector segment append failed"));
+    }
+    keys.sort_unstable();
+    let name = format!("s{:08}", m.next);
+    m.next += 1;
+    let file = dir.join(format!("{name}.usearch"));
+    let tmp = dir.join(format!("{name}.usearch.tmp"));
+    index.save(path_str(&tmp)?).map_err(ann_err)?;
+    std::fs::File::open(&tmp)?.sync_all()?;
+    std::fs::rename(&tmp, &file)?;
+    write_keys(&dir.join(format!("{name}.ids")), &keys)?;
+    Ok(Segment {
+        name,
+        count: dest.count + added,
+        deleted: dest.deleted,
+        del: None,
+    })
+}
+
 /// Live keys of a segment.
 fn live_keys(dir: &Path, s: &Segment) -> Result<Vec<Id>> {
     let mut keys = read_keys(&dir.join(format!("{}.ids", s.name)))?;
@@ -466,43 +564,30 @@ fn live_keys(dir: &Path, s: &Segment) -> Result<Vec<Id>> {
     Ok(keys)
 }
 
-/// Size tier of a segment: 0 for flush-sized, +1 per factor of MERGE_FACTOR.
-fn tier(live: usize) -> u32 {
-    let mut t = 0;
-    let mut cap = FLUSH_CHANGES as usize * MERGE_FACTOR;
-    while live >= cap && cap < MAX_SEGMENT {
-        t += 1;
-        cap *= MERGE_FACTOR;
-    }
-    t
+/// The next merge to do, as indexes into `segs` ((count, deleted) per segment): a
+/// segment past the deletion threshold alone, or, when more than `cap` segments are
+/// below full size, the smallest of them (at least `MERGE_MIN`, enough to get back to
+/// `cap`).
+pub fn plan_merge(segs: &[(usize, usize)]) -> Option<Vec<usize>> {
+    plan_merge_with(segs, max_segments())
 }
 
-/// The next merge to do, as indexes into `segs`: a segment past the deletion threshold
-/// (alone, or with small neighbours), or `MERGE_FACTOR` segments of one tier.
-pub fn plan_merge(segs: &[(usize, usize)]) -> Option<Vec<usize>> {
-    // (count, deleted) per segment
+fn plan_merge_with(segs: &[(usize, usize)], cap: usize) -> Option<Vec<usize>> {
     if let Some(i) = segs
         .iter()
         .position(|&(c, d)| c > 0 && d as f64 > VACUUM_DELETED * c as f64)
     {
         return Some(vec![i]);
     }
-    let mut by_tier: HashMap<u32, Vec<usize>> = HashMap::new();
-    for (i, &(c, d)) in segs.iter().enumerate() {
-        if c - d < MAX_SEGMENT {
-            by_tier.entry(tier(c - d)).or_default().push(i);
-        }
+    let mut small: Vec<usize> = (0..segs.len())
+        .filter(|&i| segs[i].0 - segs[i].1 < MAX_SEGMENT)
+        .collect();
+    if small.len() <= cap {
+        return None;
     }
-    let mut tiers: Vec<_> = by_tier.into_iter().collect();
-    tiers.sort_by_key(|(t, _)| *t);
-    for (_, mut members) in tiers {
-        if members.len() >= MERGE_FACTOR {
-            members.sort_by_key(|&i| segs[i].0 - segs[i].1);
-            members.truncate(MERGE_FACTOR);
-            return Some(members);
-        }
-    }
-    None
+    small.sort_by_key(|&i| (segs[i].0 - segs[i].1, i));
+    small.truncate((small.len() - cap + 1).max(MERGE_MIN).min(small.len()));
+    Some(small)
 }
 
 /// Remove files no manifest refers to any more, once they are old enough.
@@ -591,12 +676,13 @@ pub fn build(store_path: &Path, dir: &Path, dim: usize, full: bool) -> Result<Co
                 if newly.is_empty() {
                     continue;
                 }
+                // nodes tombstoned inside the graph by an append stay counted
+                s.deleted += newly.len();
                 let mut all: Vec<Id> = l.deleted.iter().copied().chain(newly).collect();
                 all.sort_unstable();
                 let name = format!("{}.d{:08}", s.name, m.next);
                 m.next += 1;
                 write_keys(&dir.join(&name), &all)?;
-                s.deleted = all.len();
                 s.del = Some(name);
             }
             drop(loaded);
@@ -647,13 +733,34 @@ pub fn build(store_path: &Path, dir: &Path, dim: usize, full: bool) -> Result<Co
 
     // merges (consistent with the same snapshot: every live node is current at `seq`)
     while let Some(pick) = plan_merge(&pairs(&m)) {
+        // Append into the picked graph with the most live vectors when the rest fits next
+        // to it (Lucene's IncrementalHnswGraphMerger, Qdrant's incremental HNSW indexing);
+        // a vacuum (one segment) or an oversized merge is a fresh build. Lucene reuses a
+        // base graph up to 40% deleted; here every segment is under VACUUM_DELETED (20%)
+        // because vacuums are planned first.
+        let dest = *pick
+            .iter()
+            .max_by_key(|&&i| m.segments[i].live())
+            .expect("a merge picks segments");
         let mut ids = Vec::new();
-        for &i in &pick {
+        for &i in pick.iter().filter(|&&i| i != dest) {
             ids.extend(live_keys(dir, &m.segments[i])?);
         }
-        ids.sort_unstable();
         let mut pick = pick;
         pick.sort_unstable_by(|a, b| b.cmp(a));
+        if pick.len() > 1 && m.segments[dest].count + ids.len() <= MAX_SEGMENT {
+            ids.sort_unstable();
+            let target = m.segments[dest].clone();
+            let seg = append_into(dir, &r, &mut m, &target, &ids)?;
+            written += ids.len();
+            for i in pick {
+                m.segments.remove(i);
+            }
+            m.segments.push(seg);
+            continue;
+        }
+        ids.extend(live_keys(dir, &m.segments[dest])?);
+        ids.sort_unstable();
         for i in pick {
             m.segments.remove(i);
         }
@@ -695,22 +802,18 @@ mod tests {
     #[test]
     fn merge_plan() {
         let f = FLUSH_CHANGES as usize;
-        // fewer than MERGE_FACTOR small segments: nothing to do
-        assert_eq!(plan_merge(&[(f, 0); MERGE_FACTOR - 1]), None);
-        // MERGE_FACTOR of them: merge exactly those
-        let mut segs = vec![(f, 0); MERGE_FACTOR];
-        segs.push((200_000, 0));
-        let p = plan_merge(&segs).unwrap();
-        assert_eq!(p.len(), MERGE_FACTOR);
-        assert!(!p.contains(&MERGE_FACTOR));
+        // up to `cap` segments below full size: nothing to do
+        assert_eq!(plan_merge_with(&[(f, 0); 4], 4), None);
+        // one more: merge the smallest three
+        let segs = [(5 * f, 0), (f, 0), (3 * f, 0), (2 * f, 0), (4 * f, 0)];
+        assert_eq!(plan_merge_with(&segs, 4), Some(vec![1, 3, 2]));
+        // far over the cap: merge enough to get back to it
+        assert_eq!(plan_merge_with(&[(f, 0); 10], 4).unwrap().len(), 7);
         // a segment past the deletion threshold is vacuumed first
-        let segs = vec![(f, 0), (100_000, 25_000)];
-        assert_eq!(plan_merge(&segs), Some(vec![1]));
-        // full-size segments are never merged together
-        assert_eq!(plan_merge(&[(MAX_SEGMENT, 0); 20]), None);
-        // tiers: small segments do not merge with mid-size ones
-        let mut segs = vec![(f * MERGE_FACTOR, 0); MERGE_FACTOR - 1];
-        segs.extend(vec![(f, 0); MERGE_FACTOR - 1]);
-        assert_eq!(plan_merge(&segs), None);
+        assert_eq!(plan_merge_with(&[(f, 0), (100_000, 25_000)], 4), Some(vec![1]));
+        // full-size segments do not count and are never merged
+        let mut segs = vec![(MAX_SEGMENT, 0); 6];
+        segs.extend([(f, 0); 4]);
+        assert_eq!(plan_merge_with(&segs, 4), None);
     }
 }

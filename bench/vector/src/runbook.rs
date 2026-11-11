@@ -387,16 +387,51 @@ fn log_step(step: usize, live: usize, by: &[(String, f64, f64)]) {
     eprintln!("  step {step:>3}: live {live:>7}  {}", parts.join("  |  "));
 }
 
+fn env_usize(name: &str, default: usize) -> usize {
+    std::env::var(name).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
+}
+
+fn copy_dir(from: &Path, to: &Path) {
+    let _ = std::fs::remove_dir_all(to);
+    if let Some(parent) = to.parent() {
+        std::fs::create_dir_all(parent).unwrap();
+    }
+    let ok = std::process::Command::new("cp").arg("-a").arg(from).arg(to).status().unwrap().success();
+    assert!(ok, "copy {} -> {}", from.display(), to.display());
+}
+
+/// Development knobs (env), so iterations do not need the full 3-hour run:
+/// - RB_QUERIES: queries per search step (default all 5000; 1000 gives recall +-0.0005)
+/// - RB_EVERY: measure every Nth search step only (default 1)
+/// - RB_EFS: search widths to sweep (default 64,128,256)
+/// - RB_CKPT: runbook steps after which to save a checkpoint (work/ckpt-<label>-<step>)
+/// - RB_RESUME: checkpoint dir to continue from (skips the steps it covers)
+/// - RB_STOP: stop after this runbook step
 pub fn run_dqadb(s: Setup, truth_dir: &Path, work: &Path, label: &str, threads: usize) -> RunbookReport {
     let root = work.join("dqadb-runbook");
-    let _ = std::fs::remove_dir_all(&root);
-    Kb::init(&root, "urn:dqadb:").unwrap();
-    let cfg = root.join("dqadb.yaml");
-    let y = std::fs::read_to_string(&cfg)
-        .unwrap()
-        .replace("model: bge-m3\n  dim: 1024", &format!("model: runbook-precomputed\n  dim: {}", s.base.d));
-    std::fs::write(&cfg, y).unwrap();
-    std::fs::write(root.join("ontology/schema.linkml.yaml"), RB_SCHEMA).unwrap();
+    let nq_used = env_usize("RB_QUERIES", s.queries.len()).min(s.queries.len());
+    let every = env_usize("RB_EVERY", 1).max(1);
+    let stop = env_usize("RB_STOP", usize::MAX);
+    let efs: Vec<String> = std::env::var("RB_EFS").unwrap_or_else(|_| "64,128,256".into()).split(',').map(|e| format!("ef={e}")).collect();
+    let ckpt: Vec<usize> = std::env::var("RB_CKPT").ok().map(|v| v.split(',').filter_map(|x| x.parse().ok()).collect()).unwrap_or_default();
+    let mut live = Live::new(s.max_tag);
+    let mut first = 1usize;
+    if let Ok(from) = std::env::var("RB_RESUME") {
+        let from = PathBuf::from(from);
+        copy_dir(&from.join("kb"), &root);
+        live.tag_vec = serde_json::from_slice(&std::fs::read(from.join("live.json")).unwrap()).unwrap();
+        first = std::fs::read_to_string(from.join("step")).unwrap().trim().parse::<usize>().unwrap() + 1;
+        eprintln!("resumed from {} at step {first}", from.display());
+    } else {
+        let _ = std::fs::remove_dir_all(&root);
+        Kb::init(&root, "urn:dqadb:").unwrap();
+        let cfg = root.join("dqadb.yaml");
+        let y = std::fs::read_to_string(&cfg)
+            .unwrap()
+            .replace("model: bge-m3\n  dim: 1024", &format!("model: runbook-precomputed\n  dim: {}", s.base.d));
+        std::fs::write(&cfg, y).unwrap();
+        std::fs::write(root.join("ontology/schema.linkml.yaml"), RB_SCHEMA).unwrap();
+    }
     let base = Arc::new(s.base);
     let queries = Arc::new(s.queries);
     let open = || {
@@ -405,15 +440,30 @@ pub fn run_dqadb(s: Setup, truth_dir: &Path, work: &Path, label: &str, threads: 
         kb
     };
     let kb = open();
-    kb.build_ontology(true).unwrap();
+    if first == 1 {
+        kb.build_ontology(true).unwrap();
+    }
     let opts = WriteOpts { actor: "agent:bench".into(), ..Default::default() };
-    let mut live = Live::new(s.max_tag);
     let mut rep = RunbookReport { system: "dqaDB".into(), runbook: label.into(), ..Default::default() };
     let started = Instant::now();
     let readers: Vec<Kb> = (0..threads).map(|_| open()).collect();
     let nq = queries.len();
+    let mut searches = 0usize;
     for (i, op) in s.ops.iter().enumerate() {
         let step = i + 1;
+        if step < first {
+            continue;
+        }
+        if step > stop {
+            break;
+        }
+        if ckpt.contains(&(step - 1)) && step - 1 >= first {
+            let dir = work.join(format!("ckpt-{label}-{}", step - 1));
+            copy_dir(&root, &dir.join("kb"));
+            std::fs::write(dir.join("live.json"), serde_json::to_vec(&live.tag_vec).unwrap()).unwrap();
+            std::fs::write(dir.join("step"), (step - 1).to_string()).unwrap();
+            eprintln!("  checkpoint {}", dir.display());
+        }
         let t = Instant::now();
         let mut ops: Vec<serde_json::Value> = Vec::new();
         let mut ops_retract: Vec<serde_json::Value> = Vec::new();
@@ -458,12 +508,16 @@ pub fn run_dqadb(s: Setup, truth_dir: &Path, work: &Path, label: &str, threads: 
             rep.maintain_s += t.elapsed().as_secs_f64();
             continue;
         }
+        searches += 1;
+        if (searches - 1) % every != 0 {
+            continue;
+        }
         let truth = read_truth(&truth_dir.join(format!("step{step}.gt100")));
         assert_eq!(truth.nq, nq);
-        let params: Vec<String> = [64, 128, 256].iter().map(|e| format!("ef={e}")).collect();
+        let params = efs.clone();
         let (by, secs) = sweep(
             &params,
-            nq,
+            nq_used,
             threads,
             &truth,
             &|p| unsafe { std::env::set_var("DQADB_HNSW_EF", &p[3..]) },
@@ -665,4 +719,85 @@ pub fn diag_build(work: &Path, queries: &[Vec<f32>], nq: usize, conn: usize, add
         out += &format!("  ef{ef} {:.4}", hit as f64 / (10 * qs.len()) as f64);
     }
     eprintln!("{out}");
+}
+
+/// Graph quality when a segment grows by appending into an existing graph (the merge
+/// strategy), against a fresh single-threaded build of the same live set. Variants:
+/// `fresh`; `append-clean` (base without deletions: the Lucene/Qdrant rule); `append-tomb`
+/// (base with 1/7 tombstoned + 1/10 re-added keys). Env DIAG_N limits the vectors.
+pub fn diag_append(work: &Path, queries: &[Vec<f32>], nq: usize) {
+    use dqadb_core::store::Store;
+    use usearch::{Index, IndexOptions, MetricKind, ScalarKind};
+    let root = work.join("dqadb-runbook/.dqadb");
+    let store = Store::open(&root.join("index.sqlite")).unwrap();
+    let r = store.read().unwrap();
+    let mut all: Vec<(u64, Vec<f32>)> = Vec::new();
+    r.vec_each(|id, b| all.push((id, dqadb_core::embed::from_f16_bytes(b)))).unwrap();
+    all.truncate(env_usize("DIAG_N", all.len()));
+    let dim = all[0].1.len();
+    let opts = IndexOptions { dimensions: dim, metric: MetricKind::Cos, quantization: ScalarKind::F16, connectivity: 16, expansion_add: 128, ..Default::default() };
+    let half = all.len() / 2;
+    let gone: std::collections::HashSet<u64> = all[..half].iter().enumerate().filter(|(i, _)| i % 7 == 0).map(|(_, (id, _))| *id).collect();
+    let qs: Vec<Vec<f32>> = queries.iter().take(nq).map(|q| { let n = q.iter().map(|x| x * x).sum::<f32>().sqrt(); q.iter().map(|x| x / n).collect() }).collect();
+    let truth = |skip: &std::collections::HashSet<u64>| -> Vec<Vec<u64>> {
+        qs.iter().map(|qv| {
+            let mut ex: Vec<(f32, u64)> = all.iter().filter(|(id, _)| !skip.contains(id)).map(|(id, v)| (v.iter().zip(qv).map(|(a, b)| a * b).sum::<f32>(), *id)).collect();
+            ex.select_nth_unstable_by(10, |a, b| b.0.partial_cmp(&a.0).unwrap());
+            ex.truncate(10); ex.into_iter().map(|x| x.1).collect()
+        }).collect()
+    };
+    let none = std::collections::HashSet::new();
+    let (t_all, t_live) = (truth(&none), truth(&gone));
+    let f = work.join("append-test.usearch");
+    let eval = |name: &str, idx: &Index, secs: f64, exact: &[Vec<u64>]| {
+        let mut out = format!("{name:13} {secs:4.0}s");
+        let mut leaked = 0;
+        for ef in [64usize, 128, 256, 512] {
+            idx.change_expansion_search(ef);
+            let mut hit = 0;
+            for (qv, ex) in qs.iter().zip(exact) {
+                let m = idx.search(qv, 10).unwrap();
+                leaked += m.keys.iter().filter(|k| gone.contains(k) && exact.as_ptr() == t_live.as_ptr()).count();
+                hit += ex.iter().filter(|id| m.keys.contains(id)).count();
+            }
+            out += &format!("  ef{ef} {:.4}", hit as f64 / (10 * qs.len()) as f64);
+        }
+        eprintln!("{out}  removed returned {leaked}  (n {})", all.len());
+    };
+    // fresh build of the live set
+    let t = Instant::now();
+    let a = Index::new(&opts).unwrap();
+    a.reserve_capacity_and_threads(all.len(), 1).unwrap();
+    for (id, v) in all.iter().filter(|(id, _)| !gone.contains(id)) { a.add(*id, v).unwrap(); }
+    eval("fresh", &a, t.elapsed().as_secs_f64(), &t_live);
+    drop(a);
+    // base = first half, saved
+    let a = Index::new(&opts).unwrap();
+    a.reserve_capacity_and_threads(half, 1).unwrap();
+    for (id, v) in &all[..half] { a.add(*id, v).unwrap(); }
+    a.save(f.to_str().unwrap()).unwrap();
+    drop(a);
+    for tomb in [false, true] {
+        let t = Instant::now();
+        let b = Index::new(&opts).unwrap();
+        b.load(f.to_str().unwrap()).unwrap();
+        b.reserve_capacity_and_threads(all.len() + half / 10, 1).unwrap();
+        if tomb {
+            for (i, (id, v)) in all[..half].iter().enumerate() {
+                if i % 7 == 0 { b.remove(*id).unwrap(); }
+                else if i % 10 == 0 { b.remove(*id).unwrap(); b.add(*id, v).unwrap(); }
+            }
+        }
+        for (id, v) in &all[half..] { b.add(*id, v).unwrap(); }
+        let secs = t.elapsed().as_secs_f64();
+        let g = work.join("append-test2.usearch");
+        b.save(g.to_str().unwrap()).unwrap();
+        drop(b);
+        let c = Index::new(&opts).unwrap();
+        c.view(g.to_str().unwrap()).unwrap();
+        if tomb { eval("append-tomb", &c, secs, &t_live) } else { eval("append-clean", &c, secs, &t_all) }
+        drop(c);
+        let _ = std::fs::remove_file(&g);
+    }
+    let _ = std::fs::remove_file(&f);
 }

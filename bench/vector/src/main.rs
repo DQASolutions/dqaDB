@@ -804,6 +804,11 @@ async fn main() {
                     runbook::diag_build(&work, &s.queries, nq, p[0].parse().unwrap(), p[1].parse().unwrap(), p[2], p[3].parse().unwrap());
                 }
             }
+            "diag-append" => {
+                // ... <nq>
+                let s = runbook::setup(&data_dir, &rb, ds);
+                runbook::diag_append(&work, &s.queries, a[6].parse().unwrap());
+            }
             other => panic!("unknown runbook command {other}"),
         }
         return;
